@@ -21,6 +21,9 @@ pub fn validate_patch(project_root: &Path, diff: &str) -> Result<()> {
     if diff.trim().is_empty() {
         anyhow::bail!("empty patch");
     }
+    if !is_patch(diff) {
+        anyhow::bail!("diff did not contain a valid patch header");
+    }
 
     let root = project_root
         .canonicalize()
@@ -32,6 +35,15 @@ pub fn validate_patch(project_root: &Path, diff: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+pub fn is_patch(diff: &str) -> bool {
+    diff.lines().any(|line| {
+        line.starts_with("diff --git ")
+            || line.starts_with("--- ")
+            || line.starts_with("+++ ")
+            || line.starts_with("@@ ")
+    })
 }
 
 pub async fn apply_last_patch(project_root: &Path) -> Result<String> {

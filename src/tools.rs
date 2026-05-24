@@ -44,6 +44,8 @@ pub struct PendingToolCall {
     pub description: String,
     pub permissions: Vec<String>,
     pub input: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

@@ -131,7 +131,12 @@ Bender core still validates file patches so they stay inside the folder Bender
 is running in. Tools are separate executable code, so only add tool folders you
 trust.
 
-See `examples/tools/hello` and `examples/tools/github-pr` for starter tools.
+See `examples/tools/hello`, `examples/tools/github-pr`, and
+`examples/tools/github-pr-from-worktree` for starter tools.
+
+Use `github-pr` when the branch is already committed and pushed. Use
+`github-pr-from-worktree` when you want the approved tool to create a branch,
+commit the current changes, push, and open a draft PR.
 
 Bender generates its own Nostr keypair during `bender init`. It stores config in:
 
@@ -188,7 +193,7 @@ please add a notes file with ideas for the next release
 
 Bender ignores DMs from any other sender. If your request is just a question, it replies with text. If your request needs a file change, it validates and applies it automatically.
 
-Bender publishes its Nostr profile as `Bender`, with the bio `I bend things`, `profile.png` as the picture, and `bender.gif` as the banner.
+Bender publishes its Nostr profile as `Bender`, with the bio `I bend things https://github.com/lnbits/bender`, `profile.png` as the picture, and `bender.gif` as the banner.
 
 ## Local URL
 

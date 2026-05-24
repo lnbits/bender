@@ -7,16 +7,18 @@ use std::{
 use anyhow::{Context, Result};
 use axum::{
     extract::State,
-    http::header,
+    http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse},
     routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use tower_http::trace::TraceLayer;
 
 use crate::{
+    chats,
     config::{
         available_models, is_allowed_model_id, providers, Config, Provider, ToolPathConfig,
         BENDER_NAME,
@@ -60,6 +62,9 @@ struct StatusResponse {
     relays: Vec<String>,
     tool_paths: Vec<ToolPathResponse>,
     tools: Vec<tools::Tool>,
+    chats: Vec<chats::ChatSummary>,
+    active_chat_id: String,
+    messages: Vec<chats::ChatMessage>,
 }
 
 #[derive(Debug, Serialize)]
@@ -94,6 +99,23 @@ struct SaveConfigResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct AuthStatusResponse {
+    configured: bool,
+    authenticated: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthRequest {
+    password: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AuthResponse {
+    ok: bool,
+    configured: bool,
+}
+
+#[derive(Debug, Serialize)]
 struct ModelsResponse {
     models: Vec<String>,
 }
@@ -117,6 +139,16 @@ struct PickToolFolderResponse {
 #[derive(Debug, Deserialize)]
 struct AskRequest {
     instruction: String,
+    chat_id: Option<String>,
+    #[serde(default)]
+    images: Vec<AskImage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AskImage {
+    name: String,
+    media_type: String,
+    data_url: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -124,7 +156,9 @@ struct AskResponse {
     message: String,
     changed: bool,
     pending_tool: Option<tools::PendingToolCall>,
-    dm_status: Option<String>,
+    chat_id: String,
+    chats: Vec<chats::ChatSummary>,
+    messages: Vec<chats::ChatMessage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -136,7 +170,20 @@ struct ApproveToolRequest {
 struct ApproveToolResponse {
     message: String,
     output: serde_json::Value,
-    dm_status: Option<String>,
+    chats: Vec<chats::ChatSummary>,
+    messages: Vec<chats::ChatMessage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SelectChatRequest {
+    id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatResponse {
+    chat_id: String,
+    chats: Vec<chats::ChatSummary>,
+    messages: Vec<chats::ChatMessage>,
 }
 
 pub async fn bind(state: &AppState) -> Result<tokio::net::TcpListener> {
@@ -150,9 +197,16 @@ pub async fn serve(state: AppState, listener: tokio::net::TcpListener) -> Result
     let app = Router::new()
         .route("/", get(index))
         .route("/logo.png", get(logo))
+        .route("/api/auth/status", get(auth_status))
+        .route("/api/auth/login", post(auth_login))
+        .route("/api/auth/logout", post(auth_logout))
         .route("/api/status", get(status))
         .route("/api/config", post(save_config))
+        .route("/api/config/clear", post(clear_config))
+        .route("/api/config/retire", post(retire_bender))
         .route("/api/models", get(models))
+        .route("/api/chats/new", post(new_chat))
+        .route("/api/chats/select", post(select_chat))
         .route("/api/ask", post(ask))
         .route("/api/tools/pick-folder", post(pick_tool_folder))
         .route("/api/tools/path", post(add_tool_path))
@@ -173,11 +227,83 @@ async fn logo() -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "image/png")], LOGO_PNG)
 }
 
-async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
+async fn auth_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Json<AuthStatusResponse> {
+    let config = state.config.lock().await;
+    Json(AuthStatusResponse {
+        configured: config.auth_password_hash.is_some(),
+        authenticated: is_authenticated(&config, &headers),
+    })
+}
+
+async fn auth_login(
+    State(state): State<AppState>,
+    Json(request): Json<AuthRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let password = request.password.trim();
+    if password.len() < 8 {
+        return Err(anyhow::anyhow!("password must be at least 8 characters").into());
+    }
+
+    let mut config = state.config.lock().await;
+    if config.auth_password_hash.is_none() {
+        let salt = random_hex();
+        config.auth_salt = Some(salt.clone());
+        config.auth_password_hash = Some(password_hash(&salt, password));
+    } else {
+        let salt = config
+            .auth_salt
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("auth salt missing"))?;
+        let expected = config
+            .auth_password_hash
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("auth password hash missing"))?;
+        if password_hash(salt, password) != expected {
+            return Err(anyhow::anyhow!("invalid password").into());
+        }
+    }
+
+    let token = random_hex();
+    config.auth_session_hash = Some(session_hash(&token));
+    config.save(&state.project_root)?;
+    let mut headers = HeaderMap::new();
+    headers.insert(header::SET_COOKIE, auth_cookie(&token).parse()?);
+    Ok((
+        headers,
+        Json(AuthResponse {
+            ok: true,
+            configured: true,
+        }),
+    ))
+}
+
+async fn auth_logout(State(state): State<AppState>) -> Result<impl IntoResponse, AppError> {
+    let mut config = state.config.lock().await;
+    config.auth_session_hash = None;
+    config.save(&state.project_root)?;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::SET_COOKIE,
+        "bender_auth=; Path=/; Max-Age=0; SameSite=Lax; HttpOnly".parse()?,
+    );
+    Ok((headers, Json(AuthResponse { ok: true, configured: true })))
+}
+
+async fn status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<StatusResponse>, AppError> {
+    require_auth(&state, &headers).await?;
     let config = state.config.lock().await;
     let discovered_tools = tools::discover(&config, &state.project_root).unwrap_or_default();
     let project_root = state.project_root.canonicalize().ok();
-    Json(StatusResponse {
+    let mut chat_store = chats::load(&state.project_root)?;
+    let active_chat_id = chats::ensure_web_chat(&mut chat_store);
+    chats::save(&state.project_root, &chat_store)?;
+    Ok(Json(StatusResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
         project_root: state.project_root.display().to_string(),
         project_warning: project_warning(&state.project_root),
@@ -226,13 +352,18 @@ async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
             })
             .collect(),
         tools: discovered_tools,
-    })
+        chats: chats::summaries(&chat_store),
+        messages: chats::messages(&chat_store, &active_chat_id),
+        active_chat_id,
+    }))
 }
 
 async fn save_config(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(request): Json<SaveConfigRequest>,
 ) -> Result<Json<SaveConfigResponse>, AppError> {
+    require_auth(&state, &headers).await?;
     if !is_allowed_model_id(request.provider, &request.model) {
         return Err(anyhow::anyhow!("unsupported model").into());
     }
@@ -297,7 +428,65 @@ async fn save_config(
     }))
 }
 
-async fn models(State(state): State<AppState>) -> Result<Json<ModelsResponse>, AppError> {
+async fn clear_config(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<SaveConfigResponse>, AppError> {
+    require_auth(&state, &headers).await?;
+    let mut config = state.config.lock().await;
+    let keys = config.keys()?;
+    let bind = config.bind;
+    let relays = config.relays.clone();
+    let auth_salt = config.auth_salt.clone();
+    let auth_password_hash = config.auth_password_hash.clone();
+    let auth_session_hash = config.auth_session_hash.clone();
+    let mut reset = Config::new(keys)?;
+    reset.bind = bind;
+    reset.relays = relays;
+    reset.auth_salt = auth_salt;
+    reset.auth_password_hash = auth_password_hash;
+    reset.auth_session_hash = auth_session_hash;
+    reset.save(&state.project_root)?;
+    *config = reset;
+    *state.pending_tool.lock().await = None;
+    Ok(Json(SaveConfigResponse {
+        ok: true,
+        profile_published: false,
+    }))
+}
+
+async fn retire_bender(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<SaveConfigResponse>, AppError> {
+    require_auth(&state, &headers).await?;
+    let mut config = state.config.lock().await;
+    let bind = config.bind;
+    let relays = config.relays.clone();
+    let auth_salt = config.auth_salt.clone();
+    let auth_password_hash = config.auth_password_hash.clone();
+    let auth_session_hash = config.auth_session_hash.clone();
+    let mut retired = Config::new(nostr_sdk::prelude::Keys::generate())?;
+    retired.bind = bind;
+    retired.relays = relays;
+    retired.auth_salt = auth_salt;
+    retired.auth_password_hash = auth_password_hash;
+    retired.auth_session_hash = auth_session_hash;
+    retired.save(&state.project_root)?;
+    *config = retired;
+    *state.pending_tool.lock().await = None;
+    chats::save(&state.project_root, &chats::ChatStore::default())?;
+    Ok(Json(SaveConfigResponse {
+        ok: true,
+        profile_published: false,
+    }))
+}
+
+async fn models(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<ModelsResponse>, AppError> {
+    require_auth(&state, &headers).await?;
     let config = state.config.lock().await.clone();
     let mut models: Vec<String> = available_models(config.provider)
         .iter()
@@ -309,10 +498,43 @@ async fn models(State(state): State<AppState>) -> Result<Json<ModelsResponse>, A
     Ok(Json(ModelsResponse { models }))
 }
 
+async fn new_chat(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<ChatResponse>, AppError> {
+    require_auth(&state, &headers).await?;
+    let mut chat_store = chats::load(&state.project_root)?;
+    let chat_id = chats::new_web_chat(&mut chat_store);
+    chats::save(&state.project_root, &chat_store)?;
+    Ok(Json(ChatResponse {
+        chat_id: chat_id.clone(),
+        chats: chats::summaries(&chat_store),
+        messages: chats::messages(&chat_store, &chat_id),
+    }))
+}
+
+async fn select_chat(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<SelectChatRequest>,
+) -> Result<Json<ChatResponse>, AppError> {
+    require_auth(&state, &headers).await?;
+    let mut chat_store = chats::load(&state.project_root)?;
+    chats::set_active_web(&mut chat_store, &request.id)?;
+    chats::save(&state.project_root, &chat_store)?;
+    Ok(Json(ChatResponse {
+        chat_id: request.id.clone(),
+        chats: chats::summaries(&chat_store),
+        messages: chats::messages(&chat_store, &request.id),
+    }))
+}
+
 async fn add_tool_path(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(request): Json<AddToolPathRequest>,
 ) -> Result<Json<SaveConfigResponse>, AppError> {
+    require_auth(&state, &headers).await?;
     let mut config = state.config.lock().await;
     config.tool_paths.clear();
 
@@ -366,7 +588,11 @@ async fn add_tool_path(
     }))
 }
 
-async fn pick_tool_folder() -> Result<Json<PickToolFolderResponse>, AppError> {
+async fn pick_tool_folder(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<PickToolFolderResponse>, AppError> {
+    require_auth(&state, &headers).await?;
     let output = tokio::process::Command::new("sh")
         .arg("-c")
         .arg("command -v zenity >/dev/null 2>&1 && zenity --file-selection --directory")
@@ -387,16 +613,39 @@ async fn pick_tool_folder() -> Result<Json<PickToolFolderResponse>, AppError> {
 
 async fn ask(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(request): Json<AskRequest>,
 ) -> Result<Json<AskResponse>, AppError> {
+    require_auth(&state, &headers).await?;
+    let mut chat_store = chats::load(&state.project_root)?;
+    let chat_id = match request.chat_id.as_deref() {
+        Some(id) if chat_store.chats.iter().any(|chat| chat.id == id) => id.to_string(),
+        _ => chats::ensure_web_chat(&mut chat_store),
+    };
+    let conversation = chats::conversation_prompt(&chat_store, &chat_id);
     let config = state.config.lock().await.clone();
     let available_tools = tools::discover(&config, &state.project_root)?;
     let tools_prompt = tools::prompt_section(&available_tools);
-    let response =
-        providers::respond(&config, &state.project_root, &request.instruction, &tools_prompt)
-            .await?;
+    let images = request
+        .images
+        .iter()
+        .map(|image| providers::PromptImage {
+            name: image.name.clone(),
+            media_type: image.media_type.clone(),
+            data_url: image.data_url.clone(),
+        })
+        .collect::<Vec<_>>();
+    let response = providers::respond(
+        &config,
+        &state.project_root,
+        &request.instruction,
+        &tools_prompt,
+        &conversation,
+        &images,
+    )
+    .await?;
 
-    let changed = !response.diff.trim().is_empty();
+    let changed = patch::is_patch(&response.diff);
     if changed {
         patch::validate_patch(&state.project_root, &response.diff)?;
         patch::store_last_patch(&state.project_root, &response.diff)?;
@@ -418,6 +667,7 @@ async fn ask(
                 description: tool.description,
                 permissions: tool.permissions,
                 input: call.input.clone(),
+                chat_id: Some(chat_id.clone()),
             };
             *state.pending_tool.lock().await = Some(pending.clone());
             message.push_str("\n\nTool approval needed in the web UI.");
@@ -428,31 +678,45 @@ async fn ask(
                 "{}\n\nTool {} completed:\n{}",
                 message, result.name, result.output
             );
-            let dm_status = dm_status(&config, &message).await;
+            let user_message = display_user_message(&request.instruction, &images);
+            chats::append(&mut chat_store, &chat_id, "user", &user_message)?;
+            chats::update_title_from_user(&mut chat_store, &chat_id, &request.instruction);
+            chats::append(&mut chat_store, &chat_id, "assistant", &message)?;
+            chats::save(&state.project_root, &chat_store)?;
             return Ok(Json(AskResponse {
                 message,
                 changed,
                 pending_tool: None,
-                dm_status,
+                chats: chats::summaries(&chat_store),
+                messages: chats::messages(&chat_store, &chat_id),
+                chat_id,
             }));
         }
     } else {
         None
     };
-    let dm_status = dm_status(&config, &message).await;
+    let user_message = display_user_message(&request.instruction, &images);
+    chats::append(&mut chat_store, &chat_id, "user", &user_message)?;
+    chats::update_title_from_user(&mut chat_store, &chat_id, &request.instruction);
+    chats::append(&mut chat_store, &chat_id, "assistant", &message)?;
+    chats::save(&state.project_root, &chat_store)?;
 
     Ok(Json(AskResponse {
         message,
         changed,
         pending_tool,
-        dm_status,
+        chats: chats::summaries(&chat_store),
+        messages: chats::messages(&chat_store, &chat_id),
+        chat_id,
     }))
 }
 
 async fn approve_tool(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(request): Json<ApproveToolRequest>,
 ) -> Result<Json<ApproveToolResponse>, AppError> {
+    require_auth(&state, &headers).await?;
     let pending = {
         let mut pending_tool = state.pending_tool.lock().await;
         let pending = pending_tool
@@ -470,24 +734,20 @@ async fn approve_tool(
         .ok_or_else(|| anyhow::anyhow!("unknown tool: {}", pending.name))?;
     let result = tools::execute(&tool, &state.project_root, &pending.input).await?;
     let message = format!("Tool {} completed.", result.name);
-    let dm_status = dm_status(
-        &config,
-        &format!("{}\n{}", message, serde_json::to_string_pretty(&result.output)?),
-    )
-    .await;
+    let mut chat_store = chats::load(&state.project_root)?;
+    let chat_id = pending
+        .chat_id
+        .clone()
+        .unwrap_or_else(|| chats::ensure_web_chat(&mut chat_store));
+    let tool_output = format!("{}\n{}", message, serde_json::to_string_pretty(&result.output)?);
+    chats::append(&mut chat_store, &chat_id, "assistant", &tool_output)?;
+    chats::save(&state.project_root, &chat_store)?;
     Ok(Json(ApproveToolResponse {
         message,
         output: result.output,
-        dm_status,
+        chats: chats::summaries(&chat_store),
+        messages: chats::messages(&chat_store, &chat_id),
     }))
-}
-
-async fn dm_status(config: &Config, message: &str) -> Option<String> {
-    match nostr_agent::send_controller_dm(config, message).await {
-        Ok(true) => Some("DM sent to controller.".to_string()),
-        Ok(false) => None,
-        Err(err) => Some(format!("DM failed: {err}")),
-    }
 }
 
 fn new_pending_tool_id() -> String {
@@ -498,20 +758,118 @@ fn new_pending_tool_id() -> String {
     format!("tool-{millis}")
 }
 
-struct AppError(anyhow::Error);
+fn display_user_message(instruction: &str, images: &[providers::PromptImage]) -> String {
+    if images.is_empty() {
+        return instruction.to_string();
+    }
+    let mut message = instruction.to_string();
+    if !message.is_empty() {
+        message.push_str("\n\n");
+    }
+    message.push_str("Attached images:\n");
+    for image in images {
+        message.push_str(&format!("- {} ({})\n", image.name, image.media_type));
+    }
+    message.trim_end().to_string()
+}
+
+async fn require_auth(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
+    let config = state.config.lock().await;
+    if is_authenticated(&config, headers) {
+        Ok(())
+    } else {
+        Err(AppError::with_status(
+            anyhow::anyhow!("login required"),
+            StatusCode::UNAUTHORIZED,
+        ))
+    }
+}
+
+fn is_authenticated(config: &Config, headers: &HeaderMap) -> bool {
+    if config.auth_password_hash.is_none() {
+        return false;
+    }
+    let Some(token) = cookie_value(headers, "bender_auth") else {
+        return false;
+    };
+    config
+        .auth_session_hash
+        .as_deref()
+        .is_some_and(|expected| session_hash(&token) == expected)
+}
+
+fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    let cookies = headers.get(header::COOKIE)?.to_str().ok()?;
+    cookies.split(';').find_map(|part| {
+        let (key, value) = part.trim().split_once('=')?;
+        (key == name).then(|| value.to_string())
+    })
+}
+
+fn auth_cookie(token: &str) -> String {
+    format!("bender_auth={token}; Path=/; Max-Age=2592000; SameSite=Lax; HttpOnly")
+}
+
+fn random_hex() -> String {
+    hex(&rand::random::<[u8; 32]>())
+}
+
+fn password_hash(salt: &str, password: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(salt.as_bytes());
+    digest.update(password.as_bytes());
+    let mut bytes = digest.finalize().to_vec();
+    for _ in 0..100_000 {
+        let mut digest = Sha256::new();
+        digest.update(salt.as_bytes());
+        digest.update(&bytes);
+        bytes = digest.finalize().to_vec();
+    }
+    hex(&bytes)
+}
+
+fn session_hash(token: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(token.as_bytes());
+    hex(&digest.finalize())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    const CHARS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(CHARS[(byte >> 4) as usize] as char);
+        out.push(CHARS[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+struct AppError {
+    error: anyhow::Error,
+    status: StatusCode,
+}
+
+impl AppError {
+    fn with_status(error: anyhow::Error, status: StatusCode) -> Self {
+        Self { error, status }
+    }
+}
 
 impl<E> From<E> for AppError
 where
     E: Into<anyhow::Error>,
 {
     fn from(error: E) -> Self {
-        Self(error.into())
+        Self {
+            error: error.into(),
+            status: StatusCode::BAD_REQUEST,
+        }
     }
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
-        (axum::http::StatusCode::BAD_REQUEST, self.0.to_string()).into_response()
+        (self.status, self.error.to_string()).into_response()
     }
 }
 
@@ -523,134 +881,209 @@ const INDEX: &str = r#"<!doctype html>
   <title>Bender</title>
   <style>
     :root { color-scheme: dark; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-    body { margin: 0; background: #101827; color: #f4f7fb; }
-    main { max-width: 1040px; margin: 0 auto; padding: 28px; }
-    header { display: flex; align-items: end; justify-content: space-between; gap: 16px; border-bottom: 1px solid #2b3447; padding-bottom: 18px; }
-    footer { margin-top: 26px; border-top: 1px solid #2b3447; padding-top: 16px; text-align: center; }
-    .brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
-    .brand-logo { width: min(300px, 70vw); max-height: 96px; object-fit: contain; flex: 0 0 auto; }
-    .muted { color: #9aa9bd; font-size: 14px; }
-    .header-meta { display: flex; flex-direction: column; align-items: end; gap: 10px; min-width: 0; }
-    .tool-badges { display: flex; flex-wrap: wrap; justify-content: end; gap: 6px; max-width: 460px; }
-    .tool-badge { border: 1px solid #64b6e4; border-radius: 999px; padding: 4px 9px; background: #142238; color: #dff3ff; font-size: 12px; font-weight: 650; }
-    .grid { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 20px; margin-top: 22px; }
-    section, aside { min-width: 0; }
-    textarea, pre, input, select { width: 100%; box-sizing: border-box; border: 1px solid #2d405d; border-radius: 8px; background: #111d30; color: #f4f7fb; }
-    textarea, pre { background: #f4f0e6; color: #182234; border-color: #9eb2c6; }
-    textarea { min-height: 160px; padding: 14px; font: inherit; resize: vertical; }
-    input, select { height: 38px; padding: 0 10px; margin: 6px 0 12px; font: inherit; }
-    textarea::placeholder, input::placeholder { color: #73859d; }
-    textarea::placeholder { color: #6f7d8d; }
-    textarea:focus, input:focus, select:focus { outline: 2px solid #64b6e4; border-color: #64b6e4; }
-    label { display: block; margin-top: 10px; color: #d5deea; font-size: 13px; font-weight: 650; }
-    pre { min-height: 360px; overflow: auto; padding: 14px; font-size: 13px; line-height: 1.45; white-space: pre-wrap; }
-    button { border: 0; border-radius: 8px; padding: 10px 14px; background: #64b6e4; color: #07111e; font-weight: 650; cursor: pointer; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #101827; color: #f4f7fb; overflow: hidden; }
+    button, input, select, textarea { font: inherit; }
+    button { border: 0; border-radius: 8px; padding: 10px 12px; background: #64b6e4; color: #07111e; font-weight: 700; cursor: pointer; }
     button.secondary { background: #273349; color: #eef6ff; }
+    button.ghost { width: 100%; display: flex; justify-content: flex-start; background: transparent; color: #eef6ff; }
+    button.ghost:hover, .chat-item:hover, .chat-item.is-active { background: #1c2b42; }
     button:disabled { opacity: .55; cursor: wait; }
-    .actions { display: flex; gap: 10px; margin: 12px 0; }
-    .tool-path-actions { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center; }
-    .tool-approval { display: none; margin: 12px 0; padding: 12px; border: 1px solid #64b6e4; border-radius: 8px; background: #111d30; color: #f4f7fb; }
-    .tool-approval strong { display: block; margin-bottom: 6px; }
-    .tool-approval code { display: block; margin: 8px 0; white-space: pre-wrap; overflow-wrap: anywhere; color: #d5deea; font-size: 12px; }
-    .tool-list { margin: 8px 0 12px; padding: 0; list-style: none; }
-    .tool-list li { margin: 6px 0; padding: 8px; border: 1px solid #2d405d; border-radius: 8px; background: #111d30; font-size: 13px; }
-    .tool-list strong { display: block; color: #f4f7fb; }
-    .provider-field { display: none; }
-    .provider-field.is-visible { display: block; }
-    .warning { display: none; margin-bottom: 14px; padding: 10px 12px; border: 1px solid #b57d20; border-radius: 8px; background: #2d2106; color: #ffd887; font-size: 14px; }
+    input, select, textarea { width: 100%; border: 1px solid #2d405d; border-radius: 8px; background: #111d30; color: #f4f7fb; }
+    input, select { height: 38px; padding: 0 10px; margin: 6px 0 12px; }
+    textarea { min-height: 52px; max-height: 150px; padding: 13px 16px; resize: vertical; background: #f4f0e6; color: #182234; border-color: #9eb2c6; }
+    textarea::placeholder, input::placeholder { color: #73859d; }
+    textarea:focus, input:focus, select:focus { outline: 2px solid #64b6e4; border-color: #64b6e4; }
+    label { display: block; margin-top: 10px; color: #d5deea; font-size: 13px; font-weight: 700; }
     dl { margin: 0; }
     dt { margin-top: 12px; font-size: 12px; color: #9aa9bd; text-transform: uppercase; }
     dd { margin: 4px 0 0; overflow-wrap: anywhere; font-size: 14px; }
+    .app { display: grid; grid-template-columns: 312px minmax(0, 1fr); height: 100vh; }
+    .sidebar { display: flex; flex-direction: column; min-height: 0; height: 100vh; background: #0b1220; border-right: 1px solid #24344d; }
+    .sidebar-top { padding: 18px 16px 12px; border-bottom: 1px solid #24344d; }
+    .brand-logo { width: min(220px, 100%); max-height: 86px; object-fit: contain; display: block; }
+    .settings-panel { border-bottom: 1px solid #24344d; }
+    .settings-panel summary { list-style: none; cursor: pointer; padding: 14px 16px; color: #eef6ff; font-weight: 700; }
+    .settings-panel summary::-webkit-details-marker { display: none; }
+    .settings-panel summary::after { content: "›"; float: right; color: #64b6e4; transform: rotate(90deg); }
+    .settings-panel[open] summary::after { transform: rotate(270deg); }
+    .chat-list-wrap { min-height: 0; padding: 12px 8px; border-bottom: 1px solid #24344d; }
+    .chat-list-title { margin: 12px 8px 8px; color: #9aa9bd; font-size: 12px; text-transform: uppercase; }
+    .chat-list { max-height: 226px; overflow-y: auto; padding-right: 3px; }
+    .chat-item { width: 100%; display: block; margin: 2px 0; padding: 10px 12px; border-radius: 8px; color: #eef6ff; background: transparent; text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .settings { max-height: min(58vh, 560px); overflow-y: auto; padding: 0 16px 18px; }
+    .main { min-width: 0; min-height: 0; height: 100vh; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; background: #101827; }
+    .topbar { min-height: 88px; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 20px 28px; border-bottom: 1px solid #24344d; }
+    .project { color: #9aa9bd; overflow-wrap: anywhere; text-align: right; }
+    .tool-badges { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
+    .tool-badge { border: 1px solid #64b6e4; border-radius: 999px; padding: 4px 9px; background: #142238; color: #dff3ff; font-size: 12px; font-weight: 700; }
+    .messages { min-height: 0; overflow-y: auto; padding: 28px max(28px, calc((100vw - 1160px) / 2)); }
+    .message { display: flex; margin: 0 0 18px; }
+    .message.user { justify-content: flex-end; }
+    .bubble { max-width: min(760px, 88%); padding: 14px 16px; border-radius: 18px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .message.user .bubble { background: #1e5a7b; color: #f4fbff; border-bottom-right-radius: 6px; }
+    .message.assistant .bubble, .message.system .bubble { background: #f4f0e6; color: #182234; border-bottom-left-radius: 6px; }
+    .composer { padding: 14px max(28px, calc((100vw - 1160px) / 2)) 16px; border-top: 1px solid #24344d; background: #101827; }
+    .composer-inner { max-width: 920px; margin: 0 auto; }
+    .composer-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 10px; align-items: end; }
+    .attach-button { width: 44px; height: 44px; padding: 0; border-radius: 999px; background: #273349; color: #eef6ff; }
+    .send-floating { width: 44px; height: 44px; padding: 0; border-radius: 999px; }
+    .image-input { display: none; }
+    .attachment-preview { max-width: 920px; margin: 0 auto 10px; display: flex; flex-wrap: wrap; gap: 8px; }
+    .attachment-item { position: relative; width: 72px; height: 72px; border: 1px solid #2d405d; border-radius: 8px; overflow: hidden; background: #111d30; }
+    .attachment-item img { width: 100%; height: 100%; object-fit: cover; display: block; }
+    .attachment-remove { position: absolute; top: 4px; right: 4px; width: 22px; height: 22px; padding: 0; border-radius: 999px; background: rgba(7, 17, 30, .88); color: #f4f7fb; font-size: 14px; line-height: 1; }
+    .status-line { min-height: 22px; margin-top: 8px; color: #9aa9bd; font-size: 13px; }
+    .warning { display: none; margin-bottom: 10px; padding: 10px 12px; border: 1px solid #b57d20; border-radius: 8px; background: #2d2106; color: #ffd887; font-size: 14px; }
+    .tool-approval { display: none; max-width: 920px; margin: 0 auto 12px; padding: 12px; border: 1px solid #64b6e4; border-radius: 8px; background: #111d30; color: #f4f7fb; }
+    .tool-approval strong { display: block; margin-bottom: 6px; }
+    .tool-approval code { display: block; margin: 8px 0; white-space: pre-wrap; overflow-wrap: anywhere; color: #d5deea; font-size: 12px; }
+    .tool-path-actions { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center; }
+    .settings-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 4px; }
+    .danger-button { background: #4b2634; color: #ffd8e3; }
+    .provider-field { display: none; }
+    .provider-field.is-visible { display: block; }
     .copy-value { cursor: pointer; border-radius: 6px; padding: 4px 6px; margin-left: -6px; }
     .copy-value:hover { background: #1c2b42; color: #ffffff; }
-    @media (max-width: 780px) {
-      main { padding: 18px; }
-      header { align-items: start; flex-direction: column; }
-      .header-meta { align-items: start; width: 100%; }
-      .tool-badges { justify-content: start; max-width: 100%; }
-      .grid { grid-template-columns: 1fr; }
+    .login-screen { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; padding: 24px; background: #101827; }
+    .login-panel { width: min(420px, 100%); padding: 22px; border: 1px solid #24344d; border-radius: 8px; background: #0b1220; }
+    .login-panel img { width: min(240px, 100%); display: block; margin: 0 0 18px; }
+    .login-panel h1 { margin: 0 0 12px; font-size: 20px; letter-spacing: 0; }
+    .login-panel p { margin: 0 0 14px; color: #9aa9bd; }
+    .login-screen.is-hidden { display: none; }
+    .mobile-menu-button, .drawer-backdrop { display: none; }
+    @media (max-width: 860px) {
+      .app { grid-template-columns: 1fr; }
+      body { overflow: hidden; }
+      .sidebar { position: fixed; inset: 0 auto 0 0; z-index: 40; width: min(330px, 86vw); transform: translateX(-102%); transition: transform .18s ease; box-shadow: 18px 0 40px rgba(0,0,0,.35); }
+      body.drawer-open .sidebar { transform: translateX(0); }
+      .drawer-backdrop { position: fixed; inset: 0; z-index: 30; display: none; border: 0; border-radius: 0; padding: 0; background: rgba(4, 9, 17, .62); }
+      body.drawer-open .drawer-backdrop { display: block; }
+      .main { height: 100vh; min-height: 0; grid-template-rows: auto minmax(0, 1fr) auto; }
+      .settings { max-height: 58vh; }
+      .topbar { min-height: 74px; align-items: flex-start; flex-direction: column; padding: 12px 16px 12px 64px; }
+      .mobile-menu-button { position: fixed; top: 14px; left: 14px; z-index: 20; display: inline-grid; place-items: center; width: 38px; height: 38px; padding: 0; border: 1px solid #2d405d; border-radius: 8px; background: #111d30; color: #f4f7fb; font-size: 22px; line-height: 1; }
+      body.drawer-open .mobile-menu-button { left: min(calc(86vw - 52px), 278px); z-index: 50; }
+      .project { text-align: left; }
+      .tool-badges { justify-content: flex-start; }
+      .messages { padding: 18px 14px; }
+      .bubble { max-width: 92%; }
+      .composer { padding: 12px 12px 14px; }
     }
   </style>
 </head>
 <body>
-  <main>
-    <header>
-      <div class="brand">
+  <div id="loginScreen" class="login-screen">
+    <form id="loginForm" class="login-panel">
+      <img src="/logo.png" alt="Bender">
+      <h1 id="loginTitle">Unlock Bender</h1>
+      <p id="loginHelp">Enter your password to continue.</p>
+      <label for="loginPassword">Password</label>
+      <input id="loginPassword" type="password" autocomplete="current-password" />
+      <button id="loginButton" type="submit">Continue</button>
+      <div id="loginError" class="status-line"></div>
+    </form>
+  </div>
+  <button id="menuButton" class="mobile-menu-button" title="Open menu">☰</button>
+  <button id="drawerBackdrop" class="drawer-backdrop" title="Close menu"></button>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="sidebar-top">
         <img class="brand-logo" src="/logo.png" alt="Bender">
       </div>
-      <div class="header-meta">
-        <div id="headerTools" class="tool-badges"></div>
-        <div class="muted" id="project"></div>
-      </div>
-    </header>
-    <div class="grid">
-      <section>
-        <div id="warning" class="warning"></div>
-        <textarea id="instruction" placeholder="Ask Bender anything..."></textarea>
-        <div class="actions">
-          <button id="send">Send</button>
+      <details class="settings-panel">
+        <summary>Settings</summary>
+        <div class="settings">
+          <label for="provider">Provider</label>
+          <select id="provider"></select>
+          <label for="model">Model</label>
+          <select id="model"></select>
+          <button class="secondary" id="refreshModels">Refresh Models</button>
+          <label for="controllerInput">Controller npub</label>
+          <input id="controllerInput" spellcheck="false" placeholder="npub1..." />
+          <div class="provider-field" data-provider-field="openai">
+            <label for="apiKey">OpenAI API key</label>
+            <input id="apiKey" type="password" spellcheck="false" placeholder="sk-..." />
+          </div>
+          <div class="provider-field" data-provider-field="anthropic">
+            <label for="anthropicApiKey">Claude API key</label>
+            <input id="anthropicApiKey" type="password" spellcheck="false" placeholder="sk-ant-..." />
+          </div>
+          <div class="provider-field" data-provider-field="deepseek">
+            <label for="deepseekApiKey">DeepSeek API key</label>
+            <input id="deepseekApiKey" type="password" spellcheck="false" placeholder="sk-..." />
+          </div>
+          <div class="provider-field" data-provider-field="ollama">
+            <label for="ollamaBaseUrl">Ollama URL</label>
+            <input id="ollamaBaseUrl" spellcheck="false" placeholder="http://127.0.0.1:11434" />
+          </div>
+          <div class="provider-field" data-provider-field="llama_cpp">
+            <label for="llamaCppBaseUrl">llama.cpp URL</label>
+            <input id="llamaCppBaseUrl" spellcheck="false" placeholder="http://127.0.0.1:8080" />
+            <label for="llamaCppApiKey">llama.cpp API key</label>
+            <input id="llamaCppApiKey" type="password" spellcheck="false" placeholder="optional" />
+          </div>
+          <div class="settings-actions">
+            <button id="saveConfig">Save Setup</button>
+            <button class="secondary" id="clearConfig">Clear Settings</button>
+            <button class="danger-button" id="retireBender">Retire Bender</button>
+          </div>
+          <label for="toolPathInput">Tool folder</label>
+          <div class="tool-path-actions">
+            <input id="toolPathInput" spellcheck="false" placeholder="/path/to/tool-or-tools-folder" />
+            <button class="secondary" id="chooseToolPath">Choose</button>
+          </div>
+          <button class="secondary" id="addToolPath">Add Tool Folder</button>
+          <dl>
+            <dt>tool paths</dt><dd id="toolPaths"></dd>
+            <dt>npub</dt><dd id="npub" class="copy-value" title="Copy npub"></dd>
+            <dt>version</dt><dd id="version"></dd>
+            <dt>auth</dt><dd id="auth"></dd>
+            <dt>relays</dt><dd id="relays"></dd>
+          </dl>
         </div>
+      </details>
+      <div class="chat-list-wrap">
+        <button class="ghost" id="newChat">New chat</button>
+        <div class="chat-list-title">Chats</div>
+        <div id="chatList" class="chat-list"></div>
+      </div>
+    </aside>
+    <main class="main">
+      <header class="topbar">
+        <div id="warning" class="warning"></div>
+        <div>
+          <div id="headerTools" class="tool-badges"></div>
+          <div id="project" class="project"></div>
+        </div>
+      </header>
+      <section id="messages" class="messages"></section>
+      <footer class="composer">
         <div id="toolApproval" class="tool-approval">
           <strong id="toolTitle"></strong>
           <div id="toolPermissions"></div>
           <code id="toolInput"></code>
           <button id="approveTool">Approve Tool</button>
         </div>
-        <pre id="output"></pre>
-      </section>
-      <aside>
-        <label for="provider">Provider</label>
-        <select id="provider"></select>
-        <label for="model">Model</label>
-        <select id="model"></select>
-        <button class="secondary" id="refreshModels">Refresh Models</button>
-        <label for="controllerInput">Controller npub</label>
-        <input id="controllerInput" spellcheck="false" placeholder="npub1..." />
-        <div class="provider-field" data-provider-field="openai">
-          <label for="apiKey">OpenAI API key</label>
-          <input id="apiKey" type="password" spellcheck="false" placeholder="sk-..." />
+        <div class="composer-inner">
+          <div id="attachmentPreview" class="attachment-preview"></div>
+          <div class="composer-row">
+            <button id="attachImage" class="attach-button" title="Attach image">＋</button>
+            <input id="imageInput" class="image-input" type="file" accept="image/*" multiple />
+            <textarea id="instruction" placeholder="Ask Bender anything..."></textarea>
+            <button id="send" class="send-floating" title="Send">↑</button>
+          </div>
+          <div id="statusLine" class="status-line"></div>
         </div>
-        <div class="provider-field" data-provider-field="anthropic">
-          <label for="anthropicApiKey">Claude API key</label>
-          <input id="anthropicApiKey" type="password" spellcheck="false" placeholder="sk-ant-..." />
-        </div>
-        <div class="provider-field" data-provider-field="deepseek">
-          <label for="deepseekApiKey">DeepSeek API key</label>
-          <input id="deepseekApiKey" type="password" spellcheck="false" placeholder="sk-..." />
-        </div>
-        <div class="provider-field" data-provider-field="ollama">
-          <label for="ollamaBaseUrl">Ollama URL</label>
-          <input id="ollamaBaseUrl" spellcheck="false" placeholder="http://127.0.0.1:11434" />
-        </div>
-        <div class="provider-field" data-provider-field="llama_cpp">
-          <label for="llamaCppBaseUrl">llama.cpp URL</label>
-          <input id="llamaCppBaseUrl" spellcheck="false" placeholder="http://127.0.0.1:8080" />
-          <label for="llamaCppApiKey">llama.cpp API key</label>
-          <input id="llamaCppApiKey" type="password" spellcheck="false" placeholder="optional" />
-        </div>
-        <button id="saveConfig">Save Setup</button>
-        <label for="toolPathInput">Tool folder</label>
-        <div class="tool-path-actions">
-          <input id="toolPathInput" spellcheck="false" placeholder="/path/to/tool-or-tools-folder" />
-          <button class="secondary" id="chooseToolPath">Choose</button>
-        </div>
-        <button class="secondary" id="addToolPath">Add Tool Folder</button>
-        <dl>
-          <dt>tool paths</dt><dd id="toolPaths"></dd>
-        </dl>
-        <dl>
-          <dt>npub</dt><dd id="npub" class="copy-value" title="Copy npub"></dd>
-          <dt>version</dt><dd id="version"></dd>
-          <dt>auth</dt><dd id="auth"></dd>
-          <dt>relays</dt><dd id="relays"></dd>
-        </dl>
-      </aside>
-    </div>
-    <footer class="muted">Made by the LNbits team</footer>
-  </main>
+      </footer>
+    </main>
+  </div>
   <script>
     const $ = id => document.getElementById(id);
     let pendingTool = null;
+    let activeChatId = null;
+    let attachedImages = [];
+    const escapeHtml = value => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
     async function api(path, body) {
       const res = await fetch(path, {
         method: body ? 'POST' : 'GET',
@@ -661,16 +1094,29 @@ const INDEX: &str = r#"<!doctype html>
       if (!res.ok) throw new Error(text);
       return text ? JSON.parse(text) : {};
     }
+    async function checkAuth() {
+      const auth = await api('/api/auth/status');
+      if (auth.authenticated) {
+        $('loginScreen').classList.add('is-hidden');
+        localStorage.setItem('bender_auth_ready', '1');
+        await load();
+        return;
+      }
+      $('loginScreen').classList.remove('is-hidden');
+      $('loginTitle').textContent = auth.configured ? 'Unlock Bender' : 'Create Bender Password';
+      $('loginHelp').textContent = auth.configured
+        ? 'Enter your password to continue.'
+        : 'Choose a password for this local Bender. It will not be stored as plain text.';
+      $('loginPassword').autocomplete = auth.configured ? 'current-password' : 'new-password';
+      $('loginPassword').focus();
+    }
     async function load() {
       const status = await api('/api/status');
       document.title = `Bender ${status.version}`;
+      activeChatId = status.active_chat_id;
       $('project').textContent = status.project_root;
-      if (status.project_warning) {
-        $('warning').textContent = status.project_warning;
-        $('warning').style.display = 'block';
-      } else {
-        $('warning').style.display = 'none';
-      }
+      $('warning').style.display = status.project_warning ? 'block' : 'none';
+      $('warning').textContent = status.project_warning || '';
       $('npub').textContent = status.npub;
       $('provider').innerHTML = status.providers.map(provider => `<option value="${provider.id}">${provider.label}</option>`).join('');
       $('provider').value = status.provider;
@@ -685,6 +1131,8 @@ const INDEX: &str = r#"<!doctype html>
       $('auth').textContent = status.has_provider_auth ? 'provider auth ready' : 'provider auth missing';
       $('relays').textContent = status.relays.join(', ');
       renderTools(status.tools, status.tool_paths);
+      renderChats(status.chats);
+      renderMessages(status.messages);
     }
     function setModels(models) {
       $('model').innerHTML = models.map(model => `<option value="${model}">${model}</option>`).join('');
@@ -695,10 +1143,45 @@ const INDEX: &str = r#"<!doctype html>
         field.classList.toggle('is-visible', field.dataset.providerField === provider);
       });
     }
+    function renderChats(chats) {
+      $('chatList').innerHTML = chats.map(chat => `
+        <button class="chat-item ${chat.id === activeChatId ? 'is-active' : ''}" data-chat-id="${chat.id}" title="${escapeHtml(chat.title)}">${escapeHtml(chat.title)}</button>
+      `).join('');
+      document.querySelectorAll('[data-chat-id]').forEach(item => {
+        item.onclick = async () => {
+          const result = await api('/api/chats/select', { id: item.dataset.chatId });
+          activeChatId = result.chat_id;
+          renderChats(result.chats);
+          renderMessages(result.messages);
+          closeDrawerOnMobile();
+        };
+      });
+    }
+    function renderMessages(messages) {
+      $('messages').innerHTML = messages.length
+        ? messages.map(message => `<div class="message ${message.role}"><div class="bubble">${escapeHtml(message.content)}</div></div>`).join('')
+        : '<div class="message assistant"><div class="bubble">Ready.</div></div>';
+      $('messages').scrollTop = $('messages').scrollHeight;
+    }
+    function appendTemporary(role, content) {
+      const node = document.createElement('div');
+      node.className = `message ${role}`;
+      node.innerHTML = `<div class="bubble">${escapeHtml(content)}</div>`;
+      $('messages').appendChild(node);
+      $('messages').scrollTop = $('messages').scrollHeight;
+    }
     async function copyText(value, copiedMessage) {
       if (!value) return;
       await navigator.clipboard.writeText(value);
-      $('output').textContent = copiedMessage;
+      $('statusLine').textContent = copiedMessage;
+    }
+    function setDrawer(open) {
+      document.body.classList.toggle('drawer-open', open);
+      $('menuButton').textContent = open ? '×' : '☰';
+      $('menuButton').title = open ? 'Close menu' : 'Open menu';
+    }
+    function closeDrawerOnMobile() {
+      if (window.matchMedia('(max-width: 860px)').matches) setDrawer(false);
     }
     function showPendingTool(tool) {
       pendingTool = tool;
@@ -713,12 +1196,80 @@ const INDEX: &str = r#"<!doctype html>
     }
     function renderTools(tools, toolPaths) {
       $('headerTools').innerHTML = tools.length
-        ? tools.map(tool => `<span class="tool-badge" title="${tool.description}">${tool.name}</span>`).join('')
+        ? tools.map(tool => `<span class="tool-badge" title="${escapeHtml(tool.description)}">${escapeHtml(tool.name)}</span>`).join('')
         : '';
-      $('toolPaths').textContent = toolPaths.length
-        ? toolPaths.map(toolPath => toolPath.path).join(', ')
-        : 'none';
+      $('toolPaths').textContent = toolPaths.length ? toolPaths.map(toolPath => toolPath.path).join(', ') : 'none';
     }
+    function renderAttachments() {
+      $('attachmentPreview').innerHTML = attachedImages.map((image, index) => `
+        <div class="attachment-item" title="${escapeHtml(image.name)}">
+          <img src="${image.data_url}" alt="${escapeHtml(image.name)}">
+          <button class="attachment-remove" data-image-index="${index}" title="Remove image">×</button>
+        </div>
+      `).join('');
+      document.querySelectorAll('[data-image-index]').forEach(button => {
+        button.onclick = () => {
+          attachedImages.splice(Number(button.dataset.imageIndex), 1);
+          renderAttachments();
+        };
+      });
+    }
+    function readImage(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve({
+          name: file.name,
+          media_type: file.type || 'image/png',
+          data_url: String(reader.result)
+        });
+        reader.onerror = () => reject(new Error(`Could not read ${file.name}`));
+        reader.readAsDataURL(file);
+      });
+    }
+    $('loginForm').onsubmit = async event => {
+      event.preventDefault();
+      $('loginButton').disabled = true;
+      $('loginError').textContent = '';
+      $('loginButton').textContent = 'Checking...';
+      try {
+        await api('/api/auth/login', { password: $('loginPassword').value });
+        $('loginPassword').value = '';
+        localStorage.setItem('bender_auth_ready', '1');
+        $('loginScreen').classList.add('is-hidden');
+        await load();
+      } catch (err) {
+        $('loginError').textContent = err.message;
+      } finally {
+        $('loginButton').disabled = false;
+        $('loginButton').textContent = 'Continue';
+      }
+    };
+    $('newChat').onclick = async () => {
+      const result = await api('/api/chats/new', {});
+      activeChatId = result.chat_id;
+      renderChats(result.chats);
+      renderMessages(result.messages);
+      closeDrawerOnMobile();
+      $('instruction').focus();
+    };
+    $('menuButton').onclick = () => setDrawer(!document.body.classList.contains('drawer-open'));
+    $('drawerBackdrop').onclick = () => setDrawer(false);
+    $('attachImage').onclick = () => $('imageInput').click();
+    $('imageInput').onchange = async () => {
+      const files = Array.from($('imageInput').files || []);
+      $('imageInput').value = '';
+      try {
+        for (const file of files) {
+          if (!file.type.startsWith('image/')) continue;
+          if (file.size > 4 * 1024 * 1024) throw new Error(`${file.name} is larger than 4 MB`);
+          if (attachedImages.length >= 3) throw new Error('Attach up to 3 images per message');
+          attachedImages.push(await readImage(file));
+        }
+        renderAttachments();
+      } catch (err) {
+        $('statusLine').textContent = err.message;
+      }
+    };
     $('saveConfig').onclick = async () => {
       $('saveConfig').disabled = true;
       try {
@@ -738,14 +1289,50 @@ const INDEX: &str = r#"<!doctype html>
         $('deepseekApiKey').value = '';
         $('llamaCppApiKey').value = '';
         await load();
-        $('output').textContent = result.profile_published
+        $('statusLine').textContent = result.profile_published
           ? 'I published my Nostr profile! Bite my shiny metal ass.'
           : 'Setup saved, but I could not publish my Nostr profile.';
       } catch (err) {
         await load();
-        $('output').textContent = err.message;
+        $('statusLine').textContent = err.message;
       } finally {
         $('saveConfig').disabled = false;
+      }
+    };
+    $('clearConfig').onclick = async () => {
+      if (!confirm('Clear provider keys, controller npub, selected provider/model, and tool folders?')) return;
+      $('clearConfig').disabled = true;
+      try {
+        await api('/api/config/clear', {});
+        $('apiKey').value = '';
+        $('anthropicApiKey').value = '';
+        $('deepseekApiKey').value = '';
+        $('llamaCppApiKey').value = '';
+        $('toolPathInput').value = '';
+        await load();
+        $('statusLine').textContent = 'Settings cleared.';
+      } catch (err) {
+        $('statusLine').textContent = err.message;
+      } finally {
+        $('clearConfig').disabled = false;
+      }
+    };
+    $('retireBender').onclick = async () => {
+      if (!confirm('Retire this Bender and create a fresh identity? This replaces the npub/nsec and clears chats/settings.')) return;
+      $('retireBender').disabled = true;
+      try {
+        await api('/api/config/retire', {});
+        $('apiKey').value = '';
+        $('anthropicApiKey').value = '';
+        $('deepseekApiKey').value = '';
+        $('llamaCppApiKey').value = '';
+        $('toolPathInput').value = '';
+        await load();
+        $('statusLine').textContent = 'Bender retired. A fresh Bender is ready.';
+      } catch (err) {
+        $('statusLine').textContent = err.message;
+      } finally {
+        $('retireBender').disabled = false;
       }
     };
     $('refreshModels').onclick = async () => {
@@ -753,11 +1340,11 @@ const INDEX: &str = r#"<!doctype html>
       try {
         const current = $('model').value;
         const result = await api('/api/models');
-        $('model').innerHTML = result.models.map(model => `<option value="${model}">${model}</option>`).join('');
+        setModels(result.models);
         if (result.models.includes(current)) $('model').value = current;
-        $('output').textContent = 'Model list refreshed.';
+        $('statusLine').textContent = 'Model list refreshed.';
       } catch (err) {
-        $('output').textContent = err.message;
+        $('statusLine').textContent = err.message;
       } finally {
         $('refreshModels').disabled = false;
       }
@@ -767,7 +1354,7 @@ const INDEX: &str = r#"<!doctype html>
         const result = await api('/api/tools/pick-folder', {});
         $('toolPathInput').value = result.path;
       } catch (err) {
-        $('output').textContent = err.message;
+        $('statusLine').textContent = err.message;
       }
     };
     $('addToolPath').onclick = async () => {
@@ -776,40 +1363,59 @@ const INDEX: &str = r#"<!doctype html>
         await api('/api/tools/path', { path: $('toolPathInput').value });
         $('toolPathInput').value = '';
         await load();
-        $('output').textContent = 'Tool folder added.';
+        $('statusLine').textContent = 'Tool folder added.';
       } catch (err) {
-        $('output').textContent = err.message;
+        $('statusLine').textContent = err.message;
+        await load();
       } finally {
         $('addToolPath').disabled = false;
       }
     };
-    $('send').onclick = async () => {
+    async function sendMessage() {
+      const instruction = $('instruction').value.trim();
+      const images = attachedImages.slice();
+      if (!instruction && !images.length) return;
       $('send').disabled = true;
-      $('output').textContent = 'Thinking...';
+      $('instruction').value = '';
+      attachedImages = [];
+      renderAttachments();
+      $('statusLine').textContent = 'Thinking...';
+      appendTemporary('user', images.length
+        ? `${instruction}${instruction ? '\n\n' : ''}Attached images:\n${images.map(image => `- ${image.name} (${image.media_type})`).join('\n')}`
+        : instruction);
       try {
-        const result = await api('/api/ask', { instruction: $('instruction').value });
+        const result = await api('/api/ask', { chat_id: activeChatId, instruction, images });
+        activeChatId = result.chat_id;
         showPendingTool(result.pending_tool);
-        $('output').textContent = result.dm_status
-          ? `${result.message}\n\n${result.dm_status}`
-          : result.message;
+        renderChats(result.chats);
+        renderMessages(result.messages);
+        $('statusLine').textContent = result.changed ? 'Changed files.' : '';
       } catch (err) {
-        $('output').textContent = err.message;
+        appendTemporary('assistant', err.message);
+        $('statusLine').textContent = '';
       } finally {
         $('send').disabled = false;
+        $('instruction').focus();
       }
-    };
+    }
+    $('send').onclick = sendMessage;
+    $('instruction').addEventListener('keydown', event => {
+      if (event.key === 'Enter' && !event.shiftKey) {
+        event.preventDefault();
+        sendMessage();
+      }
+    });
     $('approveTool').onclick = async () => {
       if (!pendingTool) return;
       $('approveTool').disabled = true;
       try {
         const result = await api('/api/tools/approve', { id: pendingTool.id });
         showPendingTool(null);
-        const toolOutput = `${result.message}\n${JSON.stringify(result.output, null, 2)}`;
-        $('output').textContent = result.dm_status
-          ? `${toolOutput}\n\n${result.dm_status}`
-          : toolOutput;
+        renderChats(result.chats);
+        renderMessages(result.messages);
+        $('statusLine').textContent = result.message;
       } catch (err) {
-        $('output').textContent = err.message;
+        $('statusLine').textContent = err.message;
       } finally {
         $('approveTool').disabled = false;
       }
@@ -821,7 +1427,7 @@ const INDEX: &str = r#"<!doctype html>
       syncProviderFields();
     };
     $('npub').onclick = () => copyText($('npub').textContent, 'npub copied.');
-    load().catch(err => $('output').textContent = err.message);
+    checkAuth().catch(err => $('loginError').textContent = err.message);
   </script>
 </body>
 </html>"#;

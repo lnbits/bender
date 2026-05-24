@@ -29,10 +29,29 @@ pub async fn list_models(api_key: &str) -> Result<Vec<String>> {
     Ok(ids)
 }
 
-pub async fn respond(config: &Config, prompt: &str) -> Result<types::AgentResponse> {
+pub async fn respond(
+    config: &Config,
+    prompt: &str,
+    images: &[types::PromptImage],
+) -> Result<types::AgentResponse> {
+    let input = if images.is_empty() {
+        serde_json::json!(prompt)
+    } else {
+        let mut content = vec![serde_json::json!({
+            "type": "input_text",
+            "text": prompt
+        })];
+        for image in images {
+            content.push(serde_json::json!({
+                "type": "input_image",
+                "image_url": image.data_url
+            }));
+        }
+        serde_json::json!([{ "role": "user", "content": content }])
+    };
     let body = serde_json::json!({
         "model": config.model,
-        "input": prompt
+        "input": input
     });
 
     let response = Client::new()

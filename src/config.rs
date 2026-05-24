@@ -9,7 +9,7 @@ use nostr_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 
 pub const BENDER_NAME: &str = "Bender";
-pub const BENDER_BIO: &str = "I bend things";
+pub const BENDER_BIO: &str = "I bend things https://github.com/lnbits/bender";
 pub const BENDER_PROFILE_PICTURE_URL: &str =
     "https://raw.githubusercontent.com/lnbits/bender/main/profile.png";
 pub const BENDER_PROFILE_BANNER_URL: &str =
@@ -55,6 +55,12 @@ pub struct Config {
     pub relays: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_paths: Vec<ToolPathConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_salt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_password_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_session_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,6 +133,9 @@ impl Config {
             bind: default_bind(),
             relays: default_relays(),
             tool_paths: Vec::new(),
+            auth_salt: None,
+            auth_password_hash: None,
+            auth_session_hash: None,
         })
     }
 

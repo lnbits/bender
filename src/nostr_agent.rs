@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use nostr_sdk::prelude::*;
 
 use crate::{
+    chats,
     config::{
         Config, BENDER_BIO, BENDER_NAME, BENDER_PROFILE_BANNER_URL, BENDER_PROFILE_PICTURE_URL,
     },
@@ -92,23 +93,6 @@ pub async fn publish_profile(config: &Config) -> Result<()> {
     publish_profile_with_client(&client, config).await
 }
 
-pub async fn send_controller_dm(config: &Config, message: &str) -> Result<bool> {
-    let Some(controller) = config.controller()? else {
-        return Ok(false);
-    };
-    let keys = config.keys()?;
-    let client = Client::new(keys);
-    for relay in &config.relays {
-        client.add_relay(relay).await?;
-    }
-    client.connect().await;
-    client
-        .send_private_msg(controller, message.to_string(), [])
-        .await
-        .context("could not send private reply")?;
-    Ok(true)
-}
-
 async fn publish_profile_with_client(client: &Client, _config: &Config) -> Result<()> {
     let picture = Url::parse(BENDER_PROFILE_PICTURE_URL).context("invalid profile picture URL")?;
     let banner = Url::parse(BENDER_PROFILE_BANNER_URL).context("invalid profile banner URL")?;
@@ -125,18 +109,43 @@ async fn publish_profile_with_client(client: &Client, _config: &Config) -> Resul
 
 async fn handle_message(state: &AppState, message: &str) -> Result<String> {
     let trimmed = message.trim();
+    let mut chat_store = chats::load(&state.project_root)?;
+    if trimmed.eq_ignore_ascii_case("/newchat") {
+        chats::new_nostr_chat(&mut chat_store);
+        chats::save(&state.project_root, &chat_store)?;
+        return Ok("Started a new chat.".to_string());
+    }
+    let chat_id = chats::ensure_nostr_chat(&mut chat_store);
+    let conversation = chats::conversation_prompt(&chat_store, &chat_id);
     let config = state.config.lock().await.clone();
     let available_tools = tools::discover(&config, &state.project_root)?;
     let tools_prompt = tools::prompt_section(&available_tools);
-    let response = providers::respond(&config, &state.project_root, trimmed, &tools_prompt).await?;
+    let response = providers::respond(
+        &config,
+        &state.project_root,
+        trimmed,
+        &tools_prompt,
+        &conversation,
+        &[],
+    )
+    .await?;
 
-    if response.diff.trim().is_empty() {
+    if !patch::is_patch(&response.diff) {
         if !response.tool_calls.is_empty() {
-            return Ok(format!(
+            let reply = format!(
                 "{}\n\nThis request needs a local tool approval. Open the web UI to approve and run tools.",
                 response.summary
-            ));
+            );
+            chats::append(&mut chat_store, &chat_id, "user", trimmed)?;
+            chats::update_title_from_user(&mut chat_store, &chat_id, trimmed);
+            chats::append(&mut chat_store, &chat_id, "assistant", &reply)?;
+            chats::save(&state.project_root, &chat_store)?;
+            return Ok(reply);
         }
+        chats::append(&mut chat_store, &chat_id, "user", trimmed)?;
+        chats::update_title_from_user(&mut chat_store, &chat_id, trimmed);
+        chats::append(&mut chat_store, &chat_id, "assistant", &response.summary)?;
+        chats::save(&state.project_root, &chat_store)?;
         return Ok(response.summary);
     }
 
@@ -144,12 +153,17 @@ async fn handle_message(state: &AppState, message: &str) -> Result<String> {
     patch::store_last_patch(&state.project_root, &response.diff)?;
     patch::apply_last_patch(&state.project_root).await?;
 
-    if response.tool_calls.is_empty() {
-        Ok(format!("{}\n\nDone.", response.summary))
+    let reply = if response.tool_calls.is_empty() {
+        format!("{}\n\nDone.", response.summary)
     } else {
-        Ok(format!(
+        format!(
             "{}\n\nDone applying changes. This request also needs a local tool approval. Open the web UI to approve and run tools.",
             response.summary
-        ))
-    }
+        )
+    };
+    chats::append(&mut chat_store, &chat_id, "user", trimmed)?;
+    chats::update_title_from_user(&mut chat_store, &chat_id, trimmed);
+    chats::append(&mut chat_store, &chat_id, "assistant", &reply)?;
+    chats::save(&state.project_root, &chat_store)?;
+    Ok(reply)
 }

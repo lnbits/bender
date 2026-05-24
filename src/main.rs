@@ -1,3 +1,4 @@
+mod chats;
 mod config;
 mod nostr_agent;
 mod patch;

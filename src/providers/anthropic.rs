@@ -9,12 +9,33 @@ pub async fn list_models(_config: &Config) -> Result<Vec<String>> {
     Ok(Vec::new())
 }
 
-pub async fn respond(config: &Config, prompt: &str) -> Result<types::AgentResponse> {
+pub async fn respond(
+    config: &Config,
+    prompt: &str,
+    images: &[types::PromptImage],
+) -> Result<types::AgentResponse> {
+    let mut content = vec![serde_json::json!({
+        "type": "text",
+        "text": prompt
+    })];
+    for image in images {
+        let Some((_, data)) = image.data_url.split_once(',') else {
+            continue;
+        };
+        content.push(serde_json::json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": image.media_type,
+                "data": data
+            }
+        }));
+    }
     let body = serde_json::json!({
         "model": config.model,
         "max_tokens": 4096,
         "messages": [
-            { "role": "user", "content": prompt }
+            { "role": "user", "content": content }
         ]
     });
 

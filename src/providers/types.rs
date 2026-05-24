@@ -18,6 +18,13 @@ pub struct ToolCall {
     pub input: Value,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PromptImage {
+    pub name: String,
+    pub media_type: String,
+    pub data_url: String,
+}
+
 pub fn normalize_text(text: &str) -> Result<AgentResponse> {
     match serde_json::from_str::<AgentResponse>(text) {
         Ok(response) => Ok(response),

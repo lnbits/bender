@@ -5,7 +5,7 @@
 
 Clawbot’s model is backwards. It starts with access to everything and then tries to restrict permissions afterward. Bender takes the opposite approach: it only has access to a specific folder and the tools you explicitly give it, start with minimal access, then expand only when needed.
 
-Run the Bender binary from any folder and he will only have access to that folder and what it contains. Connect over Nostr private DMs, because Nostr is good and Telegram and WhatsApp are also terrible.
+Run the Bender binary from any folder and he will only have access to that folder and what it contains. Connect over Nostr private DMs, because Nostr is good and Telegram and WhatsApp are also backwards.
 
 ```
 # For bender to only see whats in some-other-project

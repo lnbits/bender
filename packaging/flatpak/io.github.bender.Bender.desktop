@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Bender
+Comment=Local folder assistant controlled over Nostr
+Exec=bender
+Terminal=true
+Categories=Development;Utility;

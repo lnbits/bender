@@ -1,0 +1,16 @@
+name = "hello"
+version = "0.1.0"
+description = "A tiny demo Bender tool that returns a friendly JSON response."
+command = "./run.sh"
+requires_confirmation = false
+
+permissions = []
+
+[input_schema]
+type = "object"
+additional_properties = true
+
+[output_schema]
+type = "object"
+required = ["ok", "message"]
+

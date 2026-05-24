@@ -1,0 +1,22 @@
+app-id: io.github.bender.Bender
+runtime: org.freedesktop.Platform
+runtime-version: "24.08"
+sdk: org.freedesktop.Sdk
+command: bender
+finish-args:
+  - --share=network
+  - --filesystem=home
+modules:
+  - name: bender
+    buildsystem: simple
+    sources:
+      - type: file
+        path: ../../target/release/bender
+      - type: file
+        path: io.github.bender.Bender.desktop
+      - type: file
+        path: io.github.bender.Bender.metainfo.xml
+    build-commands:
+      - install -Dm755 bender /app/bin/bender
+      - install -Dm644 io.github.bender.Bender.desktop /app/share/applications/io.github.bender.Bender.desktop
+      - install -Dm644 io.github.bender.Bender.metainfo.xml /app/share/metainfo/io.github.bender.Bender.metainfo.xml

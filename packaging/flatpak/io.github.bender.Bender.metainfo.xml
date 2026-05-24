@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="console-application">
+  <id>io.github.bender.Bender</id>
+  <name>Bender</name>
+  <summary>Local folder assistant controlled over Nostr</summary>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>
+      Bender is a small local daemon that runs in one folder, serves a browser UI,
+      listens for Nostr private DMs from an allowed controller, and can answer
+      questions or make guarded file changes in that folder.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.bender.Bender.desktop</launchable>
+</component>

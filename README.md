@@ -1,5 +1,5 @@
 
-  <img src="logo.png" alt="Bender logo" width="500">
+  <img src="logo.png" alt="Bender logo" width="380">
 
 ![Beta](https://img.shields.io/badge/status-beta-f0b429)
 

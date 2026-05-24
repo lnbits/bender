@@ -1,6 +1,6 @@
-<p align="center">
-  <img src="logo.png" alt="Bender logo" width="200" height="200">
-</p>
+
+  <img src="logo.png" alt="Bender logo" width="500">
+
 
 # Bender
 
@@ -17,9 +17,9 @@ cd /home/ben/Projects/some-other-project
 /home/ben/Projects/bender/target/release/bender run
 ```
 
-<p align="center">
-  <img src="bender.gif" alt="Bender demo">
-</p>
+
+  <img src="bender.gif" alt="Clawbot is dumb" width="500">
+
 
 Bender is a tiny native Rust daemon.
 

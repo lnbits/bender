@@ -1,8 +1,5 @@
 
-  <img src="logo.png" alt="Bender logo" width="500">
-
-
-# Bender
+  <img src="logo.png" alt="Bender logo" width="300">
 
 ![Beta](https://img.shields.io/badge/status-beta-f0b429)
 
@@ -18,7 +15,7 @@ cd /home/ben/Projects/some-other-project
 ```
 
 
-  <img src="bender.gif" alt="Clawbot is dumb" width="500">
+  <img src="bender.gif" alt="Clawbot is dumb" width="300">
 
 
 Bender is a tiny native Rust daemon.

@@ -1,2 +1,6 @@
 /target/
 /.bender/
+/tests/fixtures/playwright/node_modules/
+/tests/fixtures/playwright/test-results/
+/tests/fixtures/playwright/proof/
+/tests/fixtures/playwright/fixed.txt

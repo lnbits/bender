@@ -1,0 +1,12 @@
+{
+  "name": "bender-playwright-evidence-fixture",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "playwright test --reporter=json"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.62.0"
+  }
+}

@@ -1,4 +1,6 @@
+pub mod browser;
 pub mod chats;
+pub mod codex;
 pub mod command_runner;
 pub mod config;
 pub mod doctor;
@@ -9,6 +11,7 @@ pub mod patch;
 pub mod project;
 pub mod project_config;
 pub mod providers;
+pub mod requirements;
 pub mod runtime;
 pub mod tools;
 pub mod web;

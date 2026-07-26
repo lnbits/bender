@@ -2,7 +2,12 @@ use std::{path::Path, process::Command};
 
 use serde::Serialize;
 
-use crate::{config::Config, project_config::ProjectConfig, workspace::Workspace};
+use crate::{
+    codex::{authentication_status, CodexCapabilities},
+    config::Config,
+    project_config::ProjectConfig,
+    workspace::Workspace,
+};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DoctorCheck {
@@ -12,7 +17,15 @@ pub struct DoctorCheck {
     pub required: bool,
 }
 
-pub fn run(workspace: &Workspace) -> Vec<DoctorCheck> {
+pub fn run(workspace: &Workspace, codex_smoke_test: bool) -> Vec<DoctorCheck> {
+    run_with_codex(workspace, "codex", codex_smoke_test)
+}
+
+fn run_with_codex(
+    workspace: &Workspace,
+    codex_binary: &str,
+    codex_smoke_test: bool,
+) -> Vec<DoctorCheck> {
     let mut checks = Vec::new();
     checks.push(DoctorCheck {
         name: "workspace canonicalization".into(),
@@ -55,40 +68,110 @@ pub fn run(workspace: &Workspace) -> Vec<DoctorCheck> {
         },
         required: false,
     });
-    let codex_version = output("codex", &["--version"], workspace.root());
+    let codex_version = output(codex_binary, &["--version"], workspace.root());
     checks.push(DoctorCheck {
         name: "Codex CLI installed".into(),
         ok: codex_version.is_ok(),
         detail: codex_version
             .as_ref()
             .map(|value| value.trim().to_string())
-            .unwrap_or_else(|error| error.clone()),
+            .unwrap_or_else(|_| {
+                "Codex CLI not found\n\nInstall Codex CLI, then run:\n    codex login\n    bender doctor"
+                    .into()
+            }),
         required: true,
     });
-    checks.push(DoctorCheck {
-        name: "Codex CLI version".into(),
-        ok: codex_version.is_ok(),
-        detail: codex_version.unwrap_or_else(|error| error),
-        required: true,
-    });
-    let auth = output("codex", &["login", "status"], workspace.root());
-    checks.push(DoctorCheck {
-        name: "Codex authenticated".into(),
-        ok: auth.is_ok(),
-        detail: auth
-            .map(|value| sanitize(&value))
-            .unwrap_or_else(|error| error),
-        required: true,
-    });
-    let help = output("codex", &["exec", "--help"], workspace.root());
-    checks.push(DoctorCheck {
-        name: "non-interactive Codex invocation".into(),
-        ok: help
-            .as_ref()
-            .is_ok_and(|value| value.contains("--json") && value.contains("--output-schema")),
-        detail: "requires `codex exec --json --output-schema`".into(),
-        required: true,
-    });
+    if codex_version.is_ok() {
+        match CodexCapabilities::detect(codex_binary, workspace.root()) {
+            Ok(capabilities) => {
+                for (name, ok, detail) in [
+                    (
+                        "Codex non-interactive invocation",
+                        capabilities.supports_exec,
+                        "`codex exec`",
+                    ),
+                    (
+                        "Codex workspace-directory support",
+                        capabilities.supports_working_directory,
+                        "`--cd`",
+                    ),
+                    (
+                        "Codex structured output",
+                        capabilities.supports_json
+                            && capabilities.supports_output_schema
+                            && capabilities.supports_output_last_message,
+                        "`--json`, `--output-schema`, and `--output-last-message`",
+                    ),
+                    (
+                        "Codex workspace-write sandbox",
+                        capabilities.supports_workspace_write
+                            && capabilities.supports_approval_never,
+                        "`--sandbox workspace-write --ask-for-approval never`",
+                    ),
+                    (
+                        "Codex session resumption",
+                        capabilities.supports_resume,
+                        "`codex exec resume`",
+                    ),
+                ] {
+                    checks.push(DoctorCheck {
+                        name: name.into(),
+                        ok,
+                        detail: if ok {
+                            format!("supported by {}", capabilities.version)
+                        } else {
+                            format!(
+                                "incompatible {}: unsupported capability {detail}",
+                                capabilities.version
+                            )
+                        },
+                        required: true,
+                    });
+                }
+            }
+            Err(error) => checks.push(DoctorCheck {
+                name: "Codex CLI compatibility".into(),
+                ok: false,
+                detail: error.to_string(),
+                required: true,
+            }),
+        }
+        let auth = authentication_status(codex_binary, workspace.root());
+        checks.push(DoctorCheck {
+            name: "Codex authenticated".into(),
+            ok: auth.is_ok(),
+            detail: auth.map(|value| sanitize(&value)).unwrap_or_else(|_| {
+                "Codex CLI is not authenticated\n\nRun:\n    codex login".into()
+            }),
+            required: true,
+        });
+        if codex_smoke_test {
+            let smoke = output(
+                codex_binary,
+                &[
+                    "--ask-for-approval",
+                    "never",
+                    "--sandbox",
+                    "read-only",
+                    "--cd",
+                    workspace.root().to_str().unwrap_or("."),
+                    "exec",
+                    "--ephemeral",
+                    "--json",
+                    "Without using tools, reply with the single word OK.",
+                ],
+                workspace.root(),
+            );
+            checks.push(DoctorCheck {
+                name: "Codex harmless smoke test".into(),
+                ok: smoke.is_ok(),
+                detail: smoke
+                    .map(|_| "non-interactive read-only invocation succeeded".into())
+                    .unwrap_or_else(|error| error),
+                required: true,
+            });
+        }
+    }
     checks.push(program_check(
         "Git",
         "git",
@@ -232,4 +315,58 @@ fn output(program: &str, args: &[&str], cwd: &Path) -> Result<String, String> {
 
 fn sanitize(value: &str) -> String {
     crate::jobs::redact(value.trim())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[cfg(unix)]
+    fn executable(path: &Path, contents: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, contents).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_reports_missing_auth_and_exact_incompatible_capability() {
+        let root = tempdir().unwrap();
+        let workspace = Workspace::new(root.path()).unwrap();
+        workspace.initialize().unwrap();
+        let binary = root.path().join("codex-fixture");
+        executable(
+            &binary,
+            r#"#!/bin/sh
+if [ "$1" = "--version" ]; then echo "codex-cli fixture"; exit 0; fi
+if [ "$1" = "--help" ]; then echo "exec --ask-for-approval never --sandbox read-only workspace-write --cd"; exit 0; fi
+if [ "$1" = "exec" ] && [ "$2" = "--help" ]; then echo "Run Codex non-interactively --json --output-last-message"; exit 0; fi
+if [ "$1" = "exec" ] && [ "$2" = "resume" ]; then echo "SESSION_ID --json"; exit 0; fi
+if [ "$1" = "login" ]; then echo "not logged in" >&2; exit 1; fi
+exit 1
+"#,
+        );
+        let checks = run_with_codex(&workspace, binary.to_str().unwrap(), false);
+        let schema = checks
+            .iter()
+            .find(|check| check.name == "Codex structured output")
+            .unwrap();
+        assert!(!schema.ok);
+        assert!(schema.detail.contains("--output-schema"));
+        let auth = checks
+            .iter()
+            .find(|check| check.name == "Codex authenticated")
+            .unwrap();
+        assert!(!auth.ok);
+        assert!(auth.detail.contains("codex login"));
+
+        let missing = run_with_codex(&workspace, "definitely-missing-codex", false);
+        assert!(missing
+            .iter()
+            .find(|check| check.name == "Codex CLI installed")
+            .unwrap()
+            .detail
+            .contains("Codex CLI not found"));
+    }
 }

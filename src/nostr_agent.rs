@@ -8,7 +8,7 @@ use crate::{
     config::{
         Config, BENDER_BIO, BENDER_NAME, BENDER_PROFILE_BANNER_URL, BENDER_PROFILE_PICTURE_URL,
     },
-    jobs::{append_jsonl, AcceptanceCriterion, JobState, JobStore},
+    jobs::{append_jsonl, JobState, JobStore},
     orchestrator::{GemmaReviewer, Orchestrator, SharedReviewer},
     project_config::ProjectConfig,
     web::AppState,
@@ -194,27 +194,20 @@ async fn handle_message(state: &AppState, message: &str, sender: &str) -> Result
                     "content": trimmed
                 }),
             )?;
-            let criteria = standard_criteria();
-            let specification = format!(
-                "# Proposed job specification\n\n## Original request\n\n{}\n\n## Clarification answers\n\n{}\n\n## Acceptance criteria\n\n{}",
-                job.request()?,
-                trimmed,
-                numbered_criteria(&criteria)
-            );
-            job.set_specification(&specification, &criteria)?;
-            let response = format!(
-                "Proposed acceptance criteria for {}:\n{}\n\nReply APPROVE to begin. No worker or project check will run before approval.",
-                job.record.id,
-                numbered_criteria(&criteria)
-            );
+            let conversation = crate::requirements::answer(&mut job, trimmed)?;
+            let response = crate::requirements::user_message(&job, &conversation);
             append_job_reply(&job, &chat_id, &response)?;
             response
         } else {
             let mut job = store.create(trimmed, sender, Some(chat_id.clone()))?;
-            job.transition(
-                JobState::Clarifying,
-                "Waiting for scope and acceptance clarification",
-            )?;
+            let project = ProjectConfig::load(&state.project_root)?;
+            let conversation = crate::requirements::start_configured(
+                &mut job,
+                &state.project_root,
+                &project,
+                state.worker.as_ref(),
+            )
+            .await?;
             append_jsonl(
                 &job.path("conversation.jsonl"),
                 &serde_json::json!({
@@ -225,10 +218,7 @@ async fn handle_message(state: &AppState, message: &str, sender: &str) -> Result
                     "content": trimmed
                 }),
             )?;
-            let response = format!(
-                "Before I begin {}:\n1. What observable behavior proves this is complete?\n2. Are there compatibility, security, or scope constraints?\n3. Which configured checks are required?\n\nReply with the answers; I will persist a specification for approval.",
-                job.record.id
-            );
+            let response = crate::requirements::user_message(&job, &conversation);
             append_job_reply(&job, &chat_id, &response)?;
             response
         }
@@ -238,37 +228,6 @@ async fn handle_message(state: &AppState, message: &str, sender: &str) -> Result
     chats::append(&mut chat_store, &chat_id, "assistant", &reply)?;
     chats::save(&state.project_root, &chat_store)?;
     Ok(reply)
-}
-
-fn standard_criteria() -> Vec<AcceptanceCriterion> {
-    vec![
-        AcceptanceCriterion {
-            id: "implementation".into(),
-            description: "The clarified request is implemented within the selected workspace."
-                .into(),
-            verified: false,
-        },
-        AcceptanceCriterion {
-            id: "tests".into(),
-            description: "All configured required checks pass without disabling legitimate tests."
-                .into(),
-            verified: false,
-        },
-        AcceptanceCriterion {
-            id: "evidence".into(),
-            description: "Bender records changed files, worker results, and check evidence.".into(),
-            verified: false,
-        },
-    ]
-}
-
-fn numbered_criteria(criteria: &[AcceptanceCriterion]) -> String {
-    criteria
-        .iter()
-        .enumerate()
-        .map(|(index, criterion)| format!("{}. {}", index + 1, criterion.description))
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 fn append_job_reply(job: &crate::jobs::Job, conversation_id: &str, response: &str) -> Result<()> {

@@ -32,7 +32,13 @@ enum Command {
         #[arg(long, help = "Save detected commands as this project's approved argv")]
         accept_detected: bool,
     },
-    Doctor,
+    Doctor {
+        #[arg(
+            long,
+            help = "Run a harmless authenticated Codex invocation in read-only mode"
+        )]
+        codex_smoke_test: bool,
+    },
     Jobs,
     Models,
     Workers,
@@ -54,7 +60,7 @@ async fn main() -> Result<()> {
         Command::Init => init(&workspace, false),
         Command::Run { bind } => run(workspace, bind).await,
         Command::Setup { accept_detected } => setup(&workspace, accept_detected),
-        Command::Doctor => doctor_command(&workspace),
+        Command::Doctor { codex_smoke_test } => doctor_command(&workspace, codex_smoke_test),
         Command::Jobs => jobs(&workspace),
         Command::Models => models(&workspace),
         Command::Workers => workers(&workspace),
@@ -147,9 +153,9 @@ fn setup(workspace: &Workspace, accept_detected: bool) -> Result<()> {
     Ok(())
 }
 
-fn doctor_command(workspace: &Workspace) -> Result<()> {
+fn doctor_command(workspace: &Workspace, codex_smoke_test: bool) -> Result<()> {
     init(workspace, true)?;
-    let checks = doctor::run(workspace);
+    let checks = doctor::run(workspace, codex_smoke_test);
     for check in &checks {
         let mark = if check.ok {
             "✓"

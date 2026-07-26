@@ -2,7 +2,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result};
 use axum::{
-    extract::State,
+    extract::{Path as AxumPath, State},
     http::{header, HeaderMap, StatusCode},
     response::{Html, IntoResponse},
     routing::{get, post},
@@ -19,7 +19,7 @@ use crate::{
         available_models, is_allowed_model_id, providers, Config, Provider, ToolPathConfig,
         BENDER_NAME,
     },
-    jobs::{append_jsonl, AcceptanceCriterion, JobRecord, JobState, JobStore},
+    jobs::{append_jsonl, JobRecord, JobState, JobStore},
     nostr_agent,
     orchestrator::{GemmaReviewer, Orchestrator, SharedReviewer},
     project_config::ProjectConfig,
@@ -195,6 +195,22 @@ struct JobActionRequest {
     id: String,
 }
 
+#[derive(Debug, Serialize)]
+struct JobDetailResponse {
+    record: JobRecord,
+    requirements: serde_json::Value,
+    specification: String,
+    acceptance_criteria: serde_json::Value,
+    worker_invocations: Vec<serde_json::Value>,
+    check_results: serde_json::Value,
+    review: serde_json::Value,
+    completion_gates: serde_json::Value,
+    playwright_results: Vec<serde_json::Value>,
+    artifacts: Vec<String>,
+    codex_compatibility: serde_json::Value,
+    final_report: String,
+}
+
 pub async fn bind(state: &AppState) -> Result<tokio::net::TcpListener> {
     let bind = state.config.lock().await.bind;
     tokio::net::TcpListener::bind(bind)
@@ -215,6 +231,7 @@ pub async fn serve(state: AppState, listener: tokio::net::TcpListener) -> Result
         .route("/api/config/retire", post(retire_bender))
         .route("/api/models", get(models))
         .route("/api/jobs", get(list_jobs))
+        .route("/api/jobs/{id}", get(job_detail))
         .route("/api/jobs/cancel", post(cancel_job))
         .route("/api/jobs/retry", post(retry_job))
         .route("/api/chats/new", post(new_chat))
@@ -376,6 +393,84 @@ async fn list_jobs(
 ) -> Result<Json<Vec<JobRecord>>, AppError> {
     require_auth(&state, &headers).await?;
     Ok(Json(JobStore::new(&state.project_root)?.list()?))
+}
+
+async fn job_detail(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<JobDetailResponse>, AppError> {
+    require_auth(&state, &headers).await?;
+    let job = JobStore::new(&state.project_root)?.load(&id)?;
+    let json = |name: &str| -> serde_json::Value {
+        crate::jobs::read_json(&job.path(name)).unwrap_or_else(
+            |error| serde_json::json!({"status":"unavailable","error":error.to_string()}),
+        )
+    };
+    let worker_invocations = std::fs::read_to_string(job.path("worker-invocations.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    let mut artifacts = Vec::new();
+    collect_artifact_paths(&job.artifact_dir(), &job.artifact_dir(), &mut artifacts)?;
+    let playwright_results = artifacts
+        .iter()
+        .filter(|path| path.starts_with("playwright-attempt-") && path.ends_with(".json"))
+        .filter_map(|path| crate::jobs::read_json(&job.artifact_dir().join(path)).ok())
+        .collect();
+    let compatibility = state
+        .worker
+        .capabilities(&state.project_root)
+        .map(|capabilities| serde_json::to_value(capabilities).unwrap_or_default())
+        .unwrap_or_else(|error| serde_json::json!({"compatible":false,"error":error.to_string()}));
+    let requirements = json("requirements.json");
+    let acceptance_criteria = json("acceptance-criteria.json");
+    let check_results = json("check-results.json");
+    let review = json("review.json");
+    let completion_gates = json("completion-gates.json");
+    let specification = std::fs::read_to_string(job.path("specification.md")).unwrap_or_default();
+    let final_report = std::fs::read_to_string(job.path("final-report.md")).unwrap_or_default();
+    Ok(Json(JobDetailResponse {
+        record: job.record,
+        requirements,
+        specification,
+        acceptance_criteria,
+        worker_invocations,
+        check_results,
+        review,
+        completion_gates,
+        playwright_results,
+        artifacts,
+        codex_compatibility: compatibility,
+        final_report,
+    }))
+}
+
+fn collect_artifact_paths(
+    root: &std::path::Path,
+    directory: &std::path::Path,
+    output: &mut Vec<String>,
+) -> Result<()> {
+    if !directory.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            collect_artifact_paths(root, &entry.path(), output)?;
+        } else {
+            let path = entry.path();
+            output.push(
+                path.strip_prefix(root)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string(),
+            );
+        }
+    }
+    output.sort();
+    Ok(())
 }
 
 async fn cancel_job(
@@ -685,7 +780,7 @@ async fn ask(
     let instruction = request.instruction.trim();
     let (message, changed) = if instruction.eq_ignore_ascii_case("APPROVE") {
         let mut job = store
-            .latest_awaiting_approval("web")?
+            .latest_awaiting_approval_any()?
             .ok_or_else(|| anyhow::anyhow!("no web job is awaiting approval"))?;
         append_web_conversation(&job, &chat_id, "web", "inbound", "APPROVE")?;
         job.approve()?;
@@ -718,39 +813,21 @@ async fn ask(
             return Err(anyhow::anyhow!("task cannot be empty").into());
         }
         if let Some(mut job) = store.latest_in_state("web", JobState::Clarifying)? {
-            let criteria = vec![
-                AcceptanceCriterion {
-                    id: "implementation".into(),
-                    description: "The clarified request is implemented within this workspace."
-                        .into(),
-                    verified: false,
-                },
-                AcceptanceCriterion {
-                    id: "checks".into(),
-                    description: "All configured required checks pass.".into(),
-                    verified: false,
-                },
-            ];
-            let specification = format!(
-                "# Proposed job specification\n\n## Original request\n\n{}\n\n## Clarification answers\n\n{instruction}\n\n## Acceptance criteria\n\n1. {}\n2. {}",
-                job.request()?,
-                criteria[0].description,
-                criteria[1].description
-            );
-            job.set_specification(&specification, &criteria)?;
             append_web_conversation(&job, &chat_id, "web", "inbound", instruction)?;
-            let response = format!(
-                "Proposed acceptance criteria for {}:\n1. {}\n2. {}\n\nReply APPROVE to begin.",
-                job.record.id, criteria[0].description, criteria[1].description
-            );
+            let conversation = crate::requirements::answer(&mut job, instruction)?;
+            let response = crate::requirements::user_message(&job, &conversation);
             append_web_conversation(&job, &chat_id, "bender", "outbound", &response)?;
             (response, false)
         } else {
             let mut job = store.create(instruction, "web", Some(chat_id.clone()))?;
-            job.transition(
-                JobState::Clarifying,
-                "Waiting for scope and acceptance clarification",
-            )?;
+            let project = ProjectConfig::load(&state.project_root)?;
+            let conversation = crate::requirements::start_configured(
+                &mut job,
+                &state.project_root,
+                &project,
+                state.worker.as_ref(),
+            )
+            .await?;
             let attachment_note = if request.images.is_empty() {
                 String::new()
             } else {
@@ -761,9 +838,10 @@ async fn ask(
             };
             append_web_conversation(&job, &chat_id, "web", "inbound", instruction)?;
             let response = format!(
-                    "Before I begin {}:\n1. What observable behavior proves this is complete?\n2. Are there compatibility, security, or scope constraints?\n3. Which configured checks are required?\n\nReply with the answers; I will persist a specification for approval.{}",
-                    job.record.id, attachment_note
-                );
+                "{}{}",
+                crate::requirements::user_message(&job, &conversation),
+                attachment_note
+            );
             append_web_conversation(&job, &chat_id, "bender", "outbound", &response)?;
             (response, false)
         }
@@ -1254,8 +1332,29 @@ const INDEX: &str = r#"<!doctype html>
     }
     function renderJobs(jobs) {
       $('jobList').innerHTML = jobs.length
-        ? jobs.map(job => `<div class="chat-item" title="${escapeHtml(job.message)}"><strong>${escapeHtml(job.state)}</strong> · attempt ${job.attempt}<br><small>${escapeHtml(job.id)}</small></div>`).join('')
+        ? jobs.map(job => `<button class="chat-item" data-job-id="${escapeHtml(job.id)}" title="${escapeHtml(job.message)}"><strong>${escapeHtml(job.state)}</strong> · attempt ${job.attempt}<br><small>${escapeHtml(job.id)}</small></button>`).join('')
         : '<div class="chat-item">No jobs yet</div>';
+      document.querySelectorAll('[data-job-id]').forEach(item => {
+        item.onclick = async () => {
+          const detail = await api(`/api/jobs/${encodeURIComponent(item.dataset.jobId)}`);
+          appendTemporary('assistant', [
+            `Job ${detail.record.id}: ${detail.record.state}`,
+            `Blocked reason: ${detail.record.message || 'none'}`,
+            `Specification:\n${detail.specification || 'not approved yet'}`,
+            `Requirements / clarification:\n${JSON.stringify(detail.requirements, null, 2)}`,
+            `Acceptance criteria and evidence:\n${JSON.stringify(detail.acceptance_criteria, null, 2)}`,
+            `Codex compatibility:\n${JSON.stringify(detail.codex_compatibility, null, 2)}`,
+            `Worker invocations:\n${JSON.stringify(detail.worker_invocations, null, 2)}`,
+            `Checks / Playwright:\n${JSON.stringify(detail.check_results, null, 2)}`,
+            `Parsed Playwright evidence:\n${JSON.stringify(detail.playwright_results, null, 2)}`,
+            `Review:\n${JSON.stringify(detail.review, null, 2)}`,
+            `Completion gates:\n${JSON.stringify(detail.completion_gates, null, 2)}`,
+            `Artifacts (screenshots, traces, logs):\n${detail.artifacts.join('\n') || 'none'}`,
+            `Final report:\n${detail.final_report || 'not complete'}`
+          ].join('\n\n'));
+          closeDrawerOnMobile();
+        };
+      });
     }
     function renderMessages(messages) {
       $('messages').innerHTML = messages.length

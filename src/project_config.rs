@@ -33,6 +33,8 @@ pub struct UiConfig {
     pub browser: String,
     #[serde(default = "default_true")]
     pub fail_on_console_error: bool,
+    #[serde(default)]
+    pub ignored_console_patterns: Vec<String>,
 }
 
 impl Default for UiConfig {
@@ -42,6 +44,7 @@ impl Default for UiConfig {
             test_command: default_ui_command(),
             browser: default_browser(),
             fail_on_console_error: true,
+            ignored_console_patterns: Vec::new(),
         }
     }
 }
@@ -72,6 +75,12 @@ pub struct CompletionPolicy {
     pub require_review: bool,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RequirementsConfig {
+    #[serde(default)]
+    pub use_primary_model: bool,
+}
+
 impl Default for CompletionPolicy {
     fn default() -> Self {
         Self {
@@ -99,6 +108,8 @@ pub struct ProjectConfig {
     pub reviewers: BTreeMap<String, WorkerSettings>,
     #[serde(default)]
     pub completion: CompletionPolicy,
+    #[serde(default)]
+    pub requirements: RequirementsConfig,
 }
 
 impl ProjectConfig {

@@ -14,12 +14,14 @@ curl -fsSL https://raw.githubusercontent.com/lnbits/bender/main/install.sh | sh
 codex login
 
 cd ~/Projects/some-project
-bender setup
-# Review the proposal, then approve its argv arrays:
-bender setup --accept-detected
 bender doctor
 bender
 ```
+
+The installer requires a published GitHub release. This repository does not
+claim that the current source version has been published. Bender is installed
+once; every invocation uses the current directory as its workspace. Codex owns
+its login state—Bender does not copy or store Codex credentials.
 
 Bare `bender` is the normal equivalent of `bender run`. It canonicalizes the current directory and never switches to Bender's installation directory. The local UI is printed at startup and binds to `127.0.0.1:7331` by default.
 
@@ -82,6 +84,10 @@ required_checks = ["lint", "typecheck", "unit"]
 max_attempts = 4
 require_approval = true
 require_review = false
+
+[requirements]
+# Optional: use Codex in read-only planning mode for the structured draft.
+use_primary_model = false
 ```
 
 Checks run with the workspace as their current directory, bounded output and timeouts, a minimal environment, no inherited SSH agent, and process-group cleanup. `sudo`, Docker, Git push, deployment, and arbitrary commands are not completion checks.
@@ -90,7 +96,7 @@ Bender tells Codex to inspect `AGENTS.md` and `.bender/instructions.md` when pre
 
 ## Job lifecycle and evidence
 
-A local or Nostr task becomes:
+A local or Nostr task uses the same persisted job and requirements logic and becomes:
 
 ```text
 Received → Clarifying → AwaitingApproval → Approved
@@ -98,7 +104,7 @@ Received → Clarifying → AwaitingApproval → Approved
 → Reviewing (optional) → Complete
 ```
 
-Other terminal/action states are `AwaitingActionApproval`, `Blocked`, `Failed`, and `Cancelled`. Each job is stored atomically under `.bender/jobs/<job-id>/` with the request, conversation, approved specification, criteria, events, worker invocations, changed files, check results, review, completion gates, artifacts, and final report.
+Other terminal/action states are `AwaitingActionApproval`, `Blocked`, `Failed`, and `Cancelled`. Each job is stored atomically under `.bender/jobs/<job-id>/` with the request, task-specific clarification questions and answers, approved specification, criterion-level required evidence, conversation, events, worker invocations, changed files, check results, review, completion gates, artifacts, and final report. Nostr-created jobs appear in the web UI, and the local web controller can approve any awaiting job.
 
 On restart, an in-flight job is marked interrupted and blocked for explicit resume/retry; Bender never assumes an old PID is alive or completes it automatically.
 
@@ -112,11 +118,11 @@ Codex implementation
 → Bender reruns checks
 ```
 
-Repeated unchanged failures and maximum attempts block the job. “Not run” is not “passed,” and all configured required gates must pass.
+Repeated unchanged failures and maximum attempts block the job. “Not run” is not “passed,” no evidence is unverified, and all configured required gates must pass. A textual worker claim or reviewer approval is not test evidence and cannot complete a job. Manual evidence requires an explicit audited human approval.
 
 ## Codex, Qwen and Gemma
 
-Codex CLI is the primary worker. Bender invokes the installed `codex exec` using argv, `--json`, a JSON output schema, `workspace-write`, an explicit approval policy, and the selected folder as `--cd`. Stdout/stderr and process metadata are retained. Hidden chain-of-thought is neither requested nor stored.
+Codex CLI is the primary worker. Bender detects CLI capabilities before invoking the installed `codex exec` using argv, `--json`, a JSON output schema, `--output-last-message`, `workspace-write`, an explicit approval policy, and the selected folder as `--cd`. Sessions resume through `codex exec resume`. Unsupported capabilities fail explicitly. Stdout/stderr and process metadata are retained. Hidden chain-of-thought is neither requested nor stored. `bender doctor --codex-smoke-test` optionally performs a harmless authenticated read-only invocation.
 
 Qwen through Ollama is an optional fallback and is never selected silently:
 
@@ -198,9 +204,35 @@ enabled = true
 test_command = "ui"
 browser = "chromium"
 fail_on_console_error = true
+ignored_console_patterns = ["*favicon.ico*"]
 ```
 
+When UI testing is configured, Bender records Playwright suite/test results, failed file/line references, screenshots, traces, videos, console errors, page exceptions, page crashes, and failed requests. Ignored console issues remain visible with the exact wildcard policy that ignored them. Playwright evidence is unavailable when UI testing is not configured.
+
 Playwright, browsers, Node, Python, Rust, Docker, Ollama, and Codex are not installed by Bender. `bender doctor` checks only ecosystems relevant to the approved project configuration.
+
+## Installer and supported platforms
+
+The checksum-verifying installer supports:
+
+- Linux x86_64 and aarch64
+- macOS x86_64 and Apple Silicon
+- Windows x86_64 from a POSIX shell
+
+Release filenames are exactly `bender-linux-x86_64`,
+`bender-linux-aarch64`, `bender-macos-x86_64`,
+`bender-macos-aarch64`, and `bender-windows-x86_64.exe`, accompanied
+by `SHA256SUMS`.
+
+```bash
+./install.sh
+./install.sh --version v0.2.0
+./install.sh --prefix "$HOME/.local"
+./install.sh --non-interactive
+```
+
+The default destination is `$HOME/.local/bin/bender`. Downloads and checksum
+failures leave an existing binary untouched.
 
 ## Development and release
 
@@ -210,8 +242,13 @@ cargo fmt --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --all-targets --all-features --locked
 cargo build --release --locked
+./scripts/validate-release.sh
 ```
 
-Release tags drive `.github/workflows/release.yml`. A maintainer reviews the clean diff and CI, updates the version/changelog, commits, creates an annotated `vX.Y.Z` tag, and pushes that tag. Bender never pushes, tags, publishes, deploys, or releases without explicit authorization.
+Pushes and pull requests run `.github/workflows/ci.yml`. Release tags drive `.github/workflows/release.yml`; validation, installer tests, deterministic orchestration, every platform build, and the complete checksum set must succeed before publication. Manual workflow dispatch builds artifacts without publishing. See `docs/release-checklist.md`.
+
+A maintainer reviews the clean diff and CI, updates the version/changelog, commits, creates a matching `vX.Y.Z` tag, and pushes that tag. Bender never pushes, tags, publishes, deploys, or releases without explicit authorization.
+
+The web interface is loopback-only by default. Remote access should normally use Nostr or SSH port forwarding, not a public bind address.
 
 Skills and thin editor clients can be added later; neither expands the workspace boundary nor overrides completion gates.

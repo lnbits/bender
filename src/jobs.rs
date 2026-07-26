@@ -10,6 +10,8 @@ use std::{
 use anyhow::{Context, Result};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
+use crate::command_runner::CommandResult;
+
 static JOB_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,7 +45,53 @@ pub struct AcceptanceCriterion {
     pub id: String,
     pub description: String,
     #[serde(default)]
-    pub verified: bool,
+    pub required_evidence: Vec<String>,
+    #[serde(default)]
+    pub evidence: Vec<CriterionEvidence>,
+    #[serde(default)]
+    pub status: CriterionStatus,
+    #[serde(default)]
+    pub reviewer_findings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CriterionStatus {
+    Verified,
+    Failed,
+    #[default]
+    Unverified,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CriterionEvidence {
+    #[serde(rename = "type")]
+    pub evidence_type: String,
+    pub reference: String,
+    pub result: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckExecution {
+    pub category: String,
+    pub result: CommandResult,
+}
+
+impl AcceptanceCriterion {
+    pub fn new(
+        id: impl Into<String>,
+        description: impl Into<String>,
+        required_evidence: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            description: description.into(),
+            required_evidence: required_evidence.into_iter().map(Into::into).collect(),
+            evidence: Vec::new(),
+            status: CriterionStatus::Unverified,
+            reviewer_findings: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,6 +100,7 @@ pub enum GateStatus {
     Passed,
     Failed,
     NotRun,
+    Skipped,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,6 +192,7 @@ impl JobStore {
         let job = Job { root, record };
         atomic_write(&job.path("request.md"), request.as_bytes())?;
         atomic_write(&job.path("specification.md"), b"")?;
+        write_json(&job.path("requirements.json"), &serde_json::json!({}))?;
         write_json(
             &job.path("acceptance-criteria.json"),
             &Vec::<AcceptanceCriterion>::new(),
@@ -213,6 +263,15 @@ impl JobStore {
 
     pub fn latest_awaiting_approval(&self, sender: &str) -> Result<Option<Job>> {
         self.latest_in_state(sender, JobState::AwaitingApproval)
+    }
+
+    pub fn latest_awaiting_approval_any(&self) -> Result<Option<Job>> {
+        for record in self.list()? {
+            if record.state == JobState::AwaitingApproval {
+                return self.load(&record.id).map(Some);
+            }
+        }
+        Ok(None)
     }
 
     pub fn latest_in_state(&self, sender: &str, state: JobState) -> Result<Option<Job>> {
@@ -309,10 +368,114 @@ impl Job {
         read_json(&self.path("acceptance-criteria.json"))
     }
 
-    pub fn mark_criteria_verified(&self) -> Result<()> {
+    pub fn apply_check_evidence(
+        &self,
+        checks: &[CheckExecution],
+        ui_category: &str,
+    ) -> Result<bool> {
         let mut criteria = self.criteria()?;
         for criterion in &mut criteria {
-            criterion.verified = true;
+            criterion
+                .evidence
+                .retain(|evidence| evidence.evidence_type == "manual");
+            for required in criterion.required_evidence.clone() {
+                let category = match required.as_str() {
+                    "unit_test" => Some("unit"),
+                    "browser_test" => Some(ui_category),
+                    "lint" => Some("lint"),
+                    "build" => Some("build"),
+                    "required_check" => None,
+                    "manual" => continue,
+                    other => Some(other),
+                };
+                for check in checks.iter().filter(|check| {
+                    category
+                        .map(|category| check.category == category)
+                        .unwrap_or(true)
+                }) {
+                    criterion.evidence.push(CriterionEvidence {
+                        evidence_type: required.clone(),
+                        reference: format!(
+                            "{}: {}",
+                            check.category,
+                            crate::command_runner::display_argv(&check.result.argv)
+                        ),
+                        result: if check.result.success() {
+                            "passed".into()
+                        } else {
+                            "failed".into()
+                        },
+                    });
+                }
+            }
+            let has_failure = criterion
+                .evidence
+                .iter()
+                .any(|evidence| evidence.result == "failed");
+            let all_required = !criterion.required_evidence.is_empty()
+                && criterion.required_evidence.iter().all(|required| {
+                    criterion.evidence.iter().any(|evidence| {
+                        evidence.evidence_type == *required && evidence.result == "passed"
+                    })
+                });
+            criterion.status = if all_required {
+                CriterionStatus::Verified
+            } else if has_failure {
+                CriterionStatus::Failed
+            } else {
+                CriterionStatus::Unverified
+            };
+        }
+        let verified = !criteria.is_empty()
+            && criteria
+                .iter()
+                .all(|criterion| criterion.status == CriterionStatus::Verified);
+        write_json(&self.path("acceptance-criteria.json"), &criteria)?;
+        Ok(verified)
+    }
+
+    pub fn add_manual_evidence(
+        &self,
+        criterion_id: &str,
+        reference: &str,
+        actor: &str,
+    ) -> Result<()> {
+        let mut criteria = self.criteria()?;
+        let criterion = criteria
+            .iter_mut()
+            .find(|criterion| criterion.id == criterion_id)
+            .with_context(|| format!("unknown acceptance criterion {criterion_id}"))?;
+        criterion.evidence.push(CriterionEvidence {
+            evidence_type: "manual".into(),
+            reference: format!("{reference} (approved by {actor})"),
+            result: "passed".into(),
+        });
+        criterion.status = if criterion.required_evidence.iter().all(|required| {
+            criterion
+                .evidence
+                .iter()
+                .any(|evidence| evidence.evidence_type == *required && evidence.result == "passed")
+        }) {
+            CriterionStatus::Verified
+        } else {
+            CriterionStatus::Unverified
+        };
+        write_json(&self.path("acceptance-criteria.json"), &criteria)?;
+        self.event(
+            "manual_evidence",
+            &format!("{actor} approved manual evidence for {criterion_id}: {reference}"),
+        )
+    }
+
+    pub fn add_reviewer_findings(&self, findings: &[(String, String)]) -> Result<()> {
+        let mut criteria = self.criteria()?;
+        for (criterion_id, finding) in findings {
+            if let Some(criterion) = criteria
+                .iter_mut()
+                .find(|criterion| criterion.id == *criterion_id)
+            {
+                criterion.reviewer_findings.push(finding.clone());
+            }
         }
         write_json(&self.path("acceptance-criteria.json"), &criteria)
     }
@@ -322,16 +485,34 @@ impl Job {
     }
 
     pub fn all_required_gates_pass(&self) -> Result<bool> {
-        Ok(self
-            .gates()?
+        let gates = self.gates()?;
+        let required = gates
             .iter()
             .filter(|gate| gate.required)
-            .all(|gate| gate.status == GateStatus::Passed))
+            .collect::<Vec<_>>();
+        Ok(!required.is_empty()
+            && required
+                .iter()
+                .all(|gate| gate.status == GateStatus::Passed))
     }
 
     pub fn finish(&mut self, report: &str) -> Result<()> {
+        if self.record.approved_at.is_none() {
+            anyhow::bail!("the specification has not been explicitly approved");
+        }
+        if self.record.interrupted {
+            anyhow::bail!("an interrupted job must be explicitly retried before completion");
+        }
         if !self.all_required_gates_pass()? {
             anyhow::bail!("required completion gates have not all passed");
+        }
+        let criteria = self.criteria()?;
+        if criteria.is_empty()
+            || criteria
+                .iter()
+                .any(|criterion| criterion.status != CriterionStatus::Verified)
+        {
+            anyhow::bail!("acceptance criteria are missing or unverified");
         }
         atomic_write(&self.path("final-report.md"), report.as_bytes())?;
         self.transition(JobState::Complete, "All required completion gates passed")
@@ -385,8 +566,10 @@ pub fn append_jsonl(path: &Path, value: &impl Serialize) -> Result<()> {
 }
 
 pub fn redact(input: &str) -> String {
-    let mut output = Vec::new();
-    for word in input.split_whitespace() {
+    let mut output = String::with_capacity(input.len());
+    for part in input.split_inclusive(char::is_whitespace) {
+        let word = part.trim_end_matches(char::is_whitespace);
+        let whitespace = &part[word.len()..];
         let looks_secret = word.starts_with("sk-")
             || word.starts_with("nsec1")
             || word.starts_with("ghp_")
@@ -395,9 +578,10 @@ pub fn redact(input: &str) -> String {
                 && word
                     .split_once('=')
                     .is_some_and(|(key, _)| key.to_ascii_lowercase().contains("token")));
-        output.push(if looks_secret { "[REDACTED]" } else { word });
+        output.push_str(if looks_secret { "[REDACTED]" } else { word });
+        output.push_str(whitespace);
     }
-    output.join(" ")
+    output
 }
 
 pub fn default_gates(required_checks: &[String], require_review: bool) -> Vec<CompletionGate> {
@@ -449,6 +633,7 @@ mod tests {
             "request.md",
             "conversation.jsonl",
             "specification.md",
+            "requirements.json",
             "acceptance-criteria.json",
             "state.json",
             "events.jsonl",
@@ -483,6 +668,31 @@ mod tests {
     }
 
     #[test]
+    fn empty_gates_and_evidence_free_criteria_cannot_complete() {
+        let root = tempdir().unwrap();
+        let store = JobStore::new(root.path()).unwrap();
+        let mut job = store.create("do it", "local", None).unwrap();
+        job.set_specification(
+            "approved spec",
+            &[AcceptanceCriterion::new(
+                "AC-1",
+                "observable behavior",
+                ["unit_test"],
+            )],
+        )
+        .unwrap();
+        job.approve().unwrap();
+        assert!(!job.all_required_gates_pass().unwrap());
+        let mut gates = default_gates(&[], false);
+        for gate in &mut gates {
+            gate.status = GateStatus::Passed;
+        }
+        job.set_gates(&gates).unwrap();
+        assert!(job.finish("claim").is_err());
+        assert_ne!(job.record.state, JobState::Complete);
+    }
+
+    #[test]
     fn approval_is_enforced() {
         let root = tempdir().unwrap();
         let store = JobStore::new(root.path()).unwrap();
@@ -490,14 +700,47 @@ mod tests {
         assert!(job.approve().is_err());
         job.set_specification(
             "approved spec",
-            &[AcceptanceCriterion {
-                id: "one".into(),
-                description: "do it".into(),
-                verified: false,
-            }],
+            &[AcceptanceCriterion::new("one", "do it", ["required_check"])],
         )
         .unwrap();
         job.approve().unwrap();
         assert_eq!(job.record.state, JobState::Approved);
+    }
+
+    #[test]
+    fn web_controller_can_find_a_nostr_job_in_the_shared_store() {
+        let root = tempdir().unwrap();
+        let store = JobStore::new(root.path()).unwrap();
+        let mut job = store
+            .create("remote task", "npub-controller", Some("nostr-chat".into()))
+            .unwrap();
+        job.set_specification(
+            "remote specification",
+            &[AcceptanceCriterion::new(
+                "AC-1",
+                "remote behavior",
+                ["unit_test"],
+            )],
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .latest_awaiting_approval_any()
+                .unwrap()
+                .unwrap()
+                .record
+                .id,
+            job.record.id
+        );
+    }
+
+    #[test]
+    fn redaction_preserves_jsonl_event_boundaries() {
+        let input = "{\"type\":\"one\"}\n{\"type\":\"two\"}\n";
+        assert_eq!(redact(input), input);
+        assert_eq!(
+            redact("token=abcdefghijklmnopqrstuvwxyz\nok"),
+            "[REDACTED]\nok"
+        );
     }
 }

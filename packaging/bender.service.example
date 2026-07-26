@@ -1,0 +1,15 @@
+[Unit]
+Description=Bender folder-scoped software-job orchestrator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/srv/projects/example
+ExecStart=/home/bender/.local/bin/bender
+Restart=on-failure
+RestartSec=5
+Environment=BENDER_BIND=127.0.0.1:7331
+
+[Install]
+WantedBy=default.target

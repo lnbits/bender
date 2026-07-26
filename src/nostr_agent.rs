@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use nostr_sdk::prelude::*;
 
@@ -6,7 +8,9 @@ use crate::{
     config::{
         Config, BENDER_BIO, BENDER_NAME, BENDER_PROFILE_BANNER_URL, BENDER_PROFILE_PICTURE_URL,
     },
-    patch, providers, tools,
+    jobs::{append_jsonl, AcceptanceCriterion, JobState, JobStore},
+    orchestrator::{GemmaReviewer, Orchestrator, SharedReviewer},
+    project_config::ProjectConfig,
     web::AppState,
 };
 
@@ -55,7 +59,7 @@ pub async fn run(state: AppState) -> Result<()> {
                             return Ok(false);
                         }
                     };
-                    if rumor.kind != Kind::PrivateDirectMessage || sender != controller {
+                    if !authorized_controller(&current_config, sender, rumor.kind) {
                         tracing::info!(
                             event_id = %event.id,
                             sender = %sender,
@@ -67,7 +71,11 @@ pub async fn run(state: AppState) -> Result<()> {
                     }
 
                     tracing::info!(sender = %sender, "received controller private message");
-                    let reply = handle_message(&state, &rumor.content)
+                    let sender_identity = current_config
+                        .controller_npub
+                        .clone()
+                        .unwrap_or_else(|| sender.to_string());
+                    let reply = handle_message(&state, &rumor.content, &sender_identity)
                         .await
                         .unwrap_or_else(|err| format!("Bender error: {err}"));
                     if let Err(err) = client.send_private_msg(sender, reply, []).await {
@@ -81,6 +89,15 @@ pub async fn run(state: AppState) -> Result<()> {
 
     client.unsubscribe(subscription.id()).await;
     result.context("nostr notification handler failed")
+}
+
+pub fn authorized_controller(config: &Config, sender: PublicKey, kind: Kind) -> bool {
+    kind == Kind::PrivateDirectMessage
+        && config
+            .controller()
+            .ok()
+            .flatten()
+            .is_some_and(|controller| controller == sender)
 }
 
 pub async fn publish_profile(config: &Config) -> Result<()> {
@@ -107,7 +124,7 @@ async fn publish_profile_with_client(client: &Client, _config: &Config) -> Resul
     Ok(())
 }
 
-async fn handle_message(state: &AppState, message: &str) -> Result<String> {
+async fn handle_message(state: &AppState, message: &str, sender: &str) -> Result<String> {
     let trimmed = message.trim();
     let mut chat_store = chats::load(&state.project_root)?;
     if trimmed.eq_ignore_ascii_case("/newchat") {
@@ -116,54 +133,200 @@ async fn handle_message(state: &AppState, message: &str) -> Result<String> {
         return Ok("Started a new chat.".to_string());
     }
     let chat_id = chats::ensure_nostr_chat(&mut chat_store);
-    let conversation = chats::conversation_prompt(&chat_store, &chat_id);
-    let config = state.config.lock().await.clone();
-    let available_tools = tools::discover(&config, &state.project_root)?;
-    let tools_prompt = tools::prompt_section(&available_tools);
-    let response = providers::respond(
-        &config,
-        &state.project_root,
-        trimmed,
-        &tools_prompt,
-        &conversation,
-        &[],
-    )
-    .await?;
-
-    if !patch::is_patch(&response.diff) {
-        if !response.tool_calls.is_empty() {
-            let reply = format!(
-                "{}\n\nThis request needs a local tool approval. Open the web UI to approve and run tools.",
-                response.summary
-            );
-            chats::append(&mut chat_store, &chat_id, "user", trimmed)?;
-            chats::update_title_from_user(&mut chat_store, &chat_id, trimmed);
-            chats::append(&mut chat_store, &chat_id, "assistant", &reply)?;
-            chats::save(&state.project_root, &chat_store)?;
-            return Ok(reply);
-        }
-        chats::append(&mut chat_store, &chat_id, "user", trimmed)?;
-        chats::update_title_from_user(&mut chat_store, &chat_id, trimmed);
-        chats::append(&mut chat_store, &chat_id, "assistant", &response.summary)?;
-        chats::save(&state.project_root, &chat_store)?;
-        return Ok(response.summary);
-    }
-
-    patch::validate_patch(&state.project_root, &response.diff)?;
-    patch::store_last_patch(&state.project_root, &response.diff)?;
-    patch::apply_last_patch(&state.project_root).await?;
-
-    let reply = if response.tool_calls.is_empty() {
-        format!("{}\n\nDone.", response.summary)
+    let store = JobStore::new(&state.project_root)?;
+    let reply = if trimmed.eq_ignore_ascii_case("APPROVE") {
+        let Some(mut job) = store.latest_awaiting_approval(sender)? else {
+            return Ok("There is no job awaiting your approval.".to_string());
+        };
+        job.approve()?;
+        append_jsonl(
+            &job.path("conversation.jsonl"),
+            &serde_json::json!({
+                "timestamp": crate::jobs::now(),
+                "conversation_id": chat_id,
+                "sender": sender,
+                "direction": "inbound",
+                "content": "APPROVE"
+            }),
+        )?;
+        let project = ProjectConfig::load(&state.project_root)?;
+        let reviewer: Option<SharedReviewer> = project
+            .reviewers
+            .get("gemma")
+            .filter(|settings| settings.enabled)
+            .map(|settings| {
+                Arc::new(GemmaReviewer::new(&settings.base_url, &settings.model)) as SharedReviewer
+            });
+        let orchestrator =
+            Orchestrator::new(&state.project_root, project, state.worker.clone(), reviewer)?;
+        let job = orchestrator.run(job).await?;
+        let response = if job.record.state == JobState::Complete {
+            format!(
+                "✓ Job complete\n\n{}",
+                std::fs::read_to_string(job.path("final-report.md"))?
+            )
+        } else {
+            format!(
+                "Job {} stopped in {:?}: {}",
+                job.record.id, job.record.state, job.record.message
+            )
+        };
+        append_jsonl(
+            &job.path("conversation.jsonl"),
+            &serde_json::json!({
+                "timestamp": crate::jobs::now(),
+                "conversation_id": chat_id,
+                "sender": "bender",
+                "direction": "outbound",
+                "content": &response
+            }),
+        )?;
+        response
     } else {
-        format!(
-            "{}\n\nDone applying changes. This request also needs a local tool approval. Open the web UI to approve and run tools.",
-            response.summary
-        )
+        if let Some(mut job) = store.latest_in_state(sender, JobState::Clarifying)? {
+            append_jsonl(
+                &job.path("conversation.jsonl"),
+                &serde_json::json!({
+                    "timestamp": crate::jobs::now(),
+                    "conversation_id": chat_id,
+                    "sender": sender,
+                    "direction": "inbound",
+                    "content": trimmed
+                }),
+            )?;
+            let criteria = standard_criteria();
+            let specification = format!(
+                "# Proposed job specification\n\n## Original request\n\n{}\n\n## Clarification answers\n\n{}\n\n## Acceptance criteria\n\n{}",
+                job.request()?,
+                trimmed,
+                numbered_criteria(&criteria)
+            );
+            job.set_specification(&specification, &criteria)?;
+            let response = format!(
+                "Proposed acceptance criteria for {}:\n{}\n\nReply APPROVE to begin. No worker or project check will run before approval.",
+                job.record.id,
+                numbered_criteria(&criteria)
+            );
+            append_job_reply(&job, &chat_id, &response)?;
+            response
+        } else {
+            let mut job = store.create(trimmed, sender, Some(chat_id.clone()))?;
+            job.transition(
+                JobState::Clarifying,
+                "Waiting for scope and acceptance clarification",
+            )?;
+            append_jsonl(
+                &job.path("conversation.jsonl"),
+                &serde_json::json!({
+                    "timestamp": crate::jobs::now(),
+                    "conversation_id": chat_id,
+                    "sender": sender,
+                    "direction": "inbound",
+                    "content": trimmed
+                }),
+            )?;
+            let response = format!(
+                "Before I begin {}:\n1. What observable behavior proves this is complete?\n2. Are there compatibility, security, or scope constraints?\n3. Which configured checks are required?\n\nReply with the answers; I will persist a specification for approval.",
+                job.record.id
+            );
+            append_job_reply(&job, &chat_id, &response)?;
+            response
+        }
     };
     chats::append(&mut chat_store, &chat_id, "user", trimmed)?;
     chats::update_title_from_user(&mut chat_store, &chat_id, trimmed);
     chats::append(&mut chat_store, &chat_id, "assistant", &reply)?;
     chats::save(&state.project_root, &chat_store)?;
     Ok(reply)
+}
+
+fn standard_criteria() -> Vec<AcceptanceCriterion> {
+    vec![
+        AcceptanceCriterion {
+            id: "implementation".into(),
+            description: "The clarified request is implemented within the selected workspace."
+                .into(),
+            verified: false,
+        },
+        AcceptanceCriterion {
+            id: "tests".into(),
+            description: "All configured required checks pass without disabling legitimate tests."
+                .into(),
+            verified: false,
+        },
+        AcceptanceCriterion {
+            id: "evidence".into(),
+            description: "Bender records changed files, worker results, and check evidence.".into(),
+            verified: false,
+        },
+    ]
+}
+
+fn numbered_criteria(criteria: &[AcceptanceCriterion]) -> String {
+    criteria
+        .iter()
+        .enumerate()
+        .map(|(index, criterion)| format!("{}. {}", index + 1, criterion.description))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn append_job_reply(job: &crate::jobs::Job, conversation_id: &str, response: &str) -> Result<()> {
+    append_jsonl(
+        &job.path("conversation.jsonl"),
+        &serde_json::json!({
+            "timestamp": crate::jobs::now(),
+            "conversation_id": conversation_id,
+            "sender": "bender",
+            "direction": "outbound",
+            "content": response
+        }),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct FakeNostrTransport {
+        accepted: Vec<String>,
+    }
+
+    impl FakeNostrTransport {
+        fn receive(&mut self, config: &Config, sender: PublicKey, kind: Kind, message: &str) {
+            if authorized_controller(config, sender, kind) {
+                self.accepted.push(message.to_string());
+            }
+        }
+    }
+
+    #[test]
+    fn only_configured_nostr_controller_is_authorized() {
+        let controller = Keys::generate();
+        let stranger = Keys::generate();
+        let mut config = Config::new(Keys::generate()).unwrap();
+        config.controller_npub = Some(controller.public_key().to_bech32().unwrap());
+        let mut transport = FakeNostrTransport {
+            accepted: Vec::new(),
+        };
+        transport.receive(
+            &config,
+            controller.public_key(),
+            Kind::PrivateDirectMessage,
+            "approved task",
+        );
+        transport.receive(
+            &config,
+            stranger.public_key(),
+            Kind::PrivateDirectMessage,
+            "malicious task",
+        );
+        transport.receive(
+            &config,
+            controller.public_key(),
+            Kind::TextNote,
+            "public task",
+        );
+        assert_eq!(transport.accepted, vec!["approved task"]);
+    }
 }

@@ -147,7 +147,7 @@ pub fn summaries(store: &ChatStore) -> Vec<ChatSummary> {
                 }),
         })
         .collect();
-    summaries.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    summaries.sort_by_key(|summary| std::cmp::Reverse(summary.updated_at));
     summaries
 }
 
@@ -177,7 +177,10 @@ pub fn update_title_from_user(store: &mut ChatStore, id: &str, user_message: &st
     if chat.title != "New chat" && chat.title != "Nostr DM" {
         return;
     }
-    let title = user_message.split_whitespace().collect::<Vec<_>>().join(" ");
+    let title = user_message
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
     if title.is_empty() {
         return;
     }

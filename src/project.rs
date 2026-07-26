@@ -74,3 +74,31 @@ fn is_ignored(path: &Path) -> bool {
             )
         })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_never_follows_external_symlinks_or_internal_state() {
+        use std::os::unix::fs::symlink;
+        let parent = tempdir().unwrap();
+        let root = parent.path().join("project");
+        let sibling = parent.path().join("sibling");
+        fs::create_dir_all(root.join(".bender")).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        fs::write(root.join("visible.txt"), "yes").unwrap();
+        fs::write(root.join(".bender/secret"), "no").unwrap();
+        fs::write(sibling.join("sentinel"), "no").unwrap();
+        symlink(&sibling, root.join("escape")).unwrap();
+
+        let files = project_files(&root).unwrap();
+        assert_eq!(files, vec![PathBuf::from("visible.txt")]);
+        let context = collect_context(&root).unwrap();
+        assert!(!context.contains("sentinel"));
+        assert!(!context.contains(".bender/secret"));
+    }
+}

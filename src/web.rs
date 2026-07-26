@@ -1,8 +1,4 @@
-use std::{
-    path::PathBuf,
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{path::PathBuf, sync::Arc};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -23,13 +19,19 @@ use crate::{
         available_models, is_allowed_model_id, providers, Config, Provider, ToolPathConfig,
         BENDER_NAME,
     },
-    nostr_agent, patch, providers, tools,
+    jobs::{append_jsonl, AcceptanceCriterion, JobRecord, JobState, JobStore},
+    nostr_agent,
+    orchestrator::{GemmaReviewer, Orchestrator, SharedReviewer},
+    project_config::ProjectConfig,
+    providers, tools,
+    worker::CodexCliWorker,
 };
 
 #[derive(Clone)]
 pub struct AppState {
     pub project_root: PathBuf,
     pub config: Arc<Mutex<Config>>,
+    pub worker: Arc<CodexCliWorker>,
     pending_tool: Arc<Mutex<Option<tools::PendingToolCall>>>,
 }
 
@@ -38,6 +40,7 @@ impl AppState {
         Self {
             project_root,
             config: Arc::new(Mutex::new(config)),
+            worker: Arc::new(CodexCliWorker::default()),
             pending_tool: Arc::new(Mutex::new(None)),
         }
     }
@@ -65,6 +68,7 @@ struct StatusResponse {
     chats: Vec<chats::ChatSummary>,
     active_chat_id: String,
     messages: Vec<chats::ChatMessage>,
+    jobs: Vec<JobRecord>,
 }
 
 #[derive(Debug, Serialize)]
@@ -186,6 +190,11 @@ struct ChatResponse {
     messages: Vec<chats::ChatMessage>,
 }
 
+#[derive(Debug, Deserialize)]
+struct JobActionRequest {
+    id: String,
+}
+
 pub async fn bind(state: &AppState) -> Result<tokio::net::TcpListener> {
     let bind = state.config.lock().await.bind;
     tokio::net::TcpListener::bind(bind)
@@ -205,6 +214,9 @@ pub async fn serve(state: AppState, listener: tokio::net::TcpListener) -> Result
         .route("/api/config/clear", post(clear_config))
         .route("/api/config/retire", post(retire_bender))
         .route("/api/models", get(models))
+        .route("/api/jobs", get(list_jobs))
+        .route("/api/jobs/cancel", post(cancel_job))
+        .route("/api/jobs/retry", post(retry_job))
         .route("/api/chats/new", post(new_chat))
         .route("/api/chats/select", post(select_chat))
         .route("/api/ask", post(ask))
@@ -289,7 +301,13 @@ async fn auth_logout(State(state): State<AppState>) -> Result<impl IntoResponse,
         header::SET_COOKIE,
         "bender_auth=; Path=/; Max-Age=0; SameSite=Lax; HttpOnly".parse()?,
     );
-    Ok((headers, Json(AuthResponse { ok: true, configured: true })))
+    Ok((
+        headers,
+        Json(AuthResponse {
+            ok: true,
+            configured: true,
+        }),
+    ))
 }
 
 async fn status(
@@ -299,7 +317,6 @@ async fn status(
     require_auth(&state, &headers).await?;
     let config = state.config.lock().await;
     let discovered_tools = tools::discover(&config, &state.project_root).unwrap_or_default();
-    let project_root = state.project_root.canonicalize().ok();
     let mut chat_store = chats::load(&state.project_root)?;
     let active_chat_id = chats::ensure_web_chat(&mut chat_store);
     chats::save(&state.project_root, &chat_store)?;
@@ -340,12 +357,6 @@ async fn status(
         tool_paths: config
             .tool_paths
             .iter()
-            .filter(|tool_path| {
-                project_root
-                    .as_ref()
-                    .and_then(|root| tool_path.path.canonicalize().ok().map(|path| (root, path)))
-                    .is_none_or(|(root, path)| !path.starts_with(root))
-            })
             .map(|tool_path| ToolPathResponse {
                 path: tool_path.path.display().to_string(),
                 enabled: tool_path.enabled,
@@ -355,7 +366,55 @@ async fn status(
         chats: chats::summaries(&chat_store),
         messages: chats::messages(&chat_store, &active_chat_id),
         active_chat_id,
+        jobs: JobStore::new(&state.project_root)?.list()?,
     }))
+}
+
+async fn list_jobs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<JobRecord>>, AppError> {
+    require_auth(&state, &headers).await?;
+    Ok(Json(JobStore::new(&state.project_root)?.list()?))
+}
+
+async fn cancel_job(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<JobActionRequest>,
+) -> Result<Json<JobRecord>, AppError> {
+    require_auth(&state, &headers).await?;
+    let store = JobStore::new(&state.project_root)?;
+    let mut job = store.load(&request.id)?;
+    if job.record.state.is_terminal() {
+        return Err(anyhow::anyhow!("job is already terminal").into());
+    }
+    let invocation_id = format!("{}-attempt-{}", job.record.id, job.record.attempt);
+    let _ = crate::worker::CodingWorker::cancel(state.worker.as_ref(), &invocation_id).await?;
+    job.transition(JobState::Cancelled, "Cancelled by local controller")?;
+    Ok(Json(job.record))
+}
+
+async fn retry_job(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<JobActionRequest>,
+) -> Result<Json<JobRecord>, AppError> {
+    require_auth(&state, &headers).await?;
+    let store = JobStore::new(&state.project_root)?;
+    let mut job = store.load(&request.id)?;
+    job.retry()?;
+    let project = ProjectConfig::load(&state.project_root)?;
+    let reviewer: Option<SharedReviewer> = project
+        .reviewers
+        .get("gemma")
+        .filter(|settings| settings.enabled)
+        .map(|settings| {
+            Arc::new(GemmaReviewer::new(&settings.base_url, &settings.model)) as SharedReviewer
+        });
+    let orchestrator =
+        Orchestrator::new(&state.project_root, project, state.worker.clone(), reviewer)?;
+    Ok(Json(orchestrator.run(job).await?.record))
 }
 
 async fn save_config(
@@ -550,16 +609,14 @@ async fn add_tool_path(
             return Err(anyhow::anyhow!("could not read tool path: {path}: {err}").into());
         }
     };
-    let project_root = state
-        .project_root
-        .canonicalize()
-        .context("could not canonicalize project root")?;
-    if path.starts_with(&project_root) {
+    let workspace = crate::workspace::Workspace::new(&state.project_root)?;
+    if workspace.resolve_read(&path).is_err()
+        || !path.starts_with(workspace.state_dir().join("tools"))
+    {
         config.save(&state.project_root)?;
-        return Err(anyhow::anyhow!(
-            "Bender can not use tools in the folder where he lives, because he could bend them"
-        )
-        .into());
+        return Err(
+            anyhow::anyhow!("tool folders must be inside this workspace at .bender/tools").into(),
+        );
     }
     if !path.is_dir() {
         config.save(&state.project_root)?;
@@ -571,10 +628,9 @@ async fn add_tool_path(
             .any(|entry| entry.path().join("bender-tool.toml").exists())
     {
         config.save(&state.project_root)?;
-        return Err(anyhow::anyhow!(
-            "tool path must contain bender-tool.toml or tool folders"
-        )
-        .into());
+        return Err(
+            anyhow::anyhow!("tool path must contain bender-tool.toml or tool folders").into(),
+        );
     }
 
     config.tool_paths.push(ToolPathConfig {
@@ -602,7 +658,10 @@ async fn pick_tool_folder(
         .await
         .context("failed to open folder picker")?;
     if !output.status.success() {
-        return Err(anyhow::anyhow!("folder picker is not available; paste the folder path instead").into());
+        return Err(anyhow::anyhow!(
+            "folder picker is not available; paste the folder path instead"
+        )
+        .into());
     }
     let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if path.is_empty() {
@@ -622,80 +681,113 @@ async fn ask(
         Some(id) if chat_store.chats.iter().any(|chat| chat.id == id) => id.to_string(),
         _ => chats::ensure_web_chat(&mut chat_store),
     };
-    let conversation = chats::conversation_prompt(&chat_store, &chat_id);
-    let config = state.config.lock().await.clone();
-    let available_tools = tools::discover(&config, &state.project_root)?;
-    let tools_prompt = tools::prompt_section(&available_tools);
-    let images = request
-        .images
-        .iter()
-        .map(|image| providers::PromptImage {
-            name: image.name.clone(),
-            media_type: image.media_type.clone(),
-            data_url: image.data_url.clone(),
-        })
-        .collect::<Vec<_>>();
-    let response = providers::respond(
-        &config,
-        &state.project_root,
-        &request.instruction,
-        &tools_prompt,
-        &conversation,
-        &images,
-    )
-    .await?;
-
-    let changed = patch::is_patch(&response.diff);
-    if changed {
-        patch::validate_patch(&state.project_root, &response.diff)?;
-        patch::store_last_patch(&state.project_root, &response.diff)?;
-        patch::apply_last_patch(&state.project_root).await?;
-    }
-
-    let mut message = if changed {
-        format!("{}\n\nDone.", response.summary)
-    } else {
-        response.summary.clone()
-    };
-    let pending_tool = if let Some(call) = response.tool_calls.first() {
-        let tool = tools::find_tool(&available_tools, &call.name)
-            .ok_or_else(|| anyhow::anyhow!("unknown tool: {}", call.name))?;
-        if tool.requires_confirmation {
-            let pending = tools::PendingToolCall {
-                id: new_pending_tool_id(),
-                name: tool.name,
-                description: tool.description,
-                permissions: tool.permissions,
-                input: call.input.clone(),
-                chat_id: Some(chat_id.clone()),
-            };
-            *state.pending_tool.lock().await = Some(pending.clone());
-            message.push_str("\n\nTool approval needed in the web UI.");
-            Some(pending)
+    let store = JobStore::new(&state.project_root)?;
+    let instruction = request.instruction.trim();
+    let (message, changed) = if instruction.eq_ignore_ascii_case("APPROVE") {
+        let mut job = store
+            .latest_awaiting_approval("web")?
+            .ok_or_else(|| anyhow::anyhow!("no web job is awaiting approval"))?;
+        append_web_conversation(&job, &chat_id, "web", "inbound", "APPROVE")?;
+        job.approve()?;
+        let project = ProjectConfig::load(&state.project_root)?;
+        let reviewer: Option<SharedReviewer> = project
+            .reviewers
+            .get("gemma")
+            .filter(|settings| settings.enabled)
+            .map(|settings| {
+                Arc::new(GemmaReviewer::new(&settings.base_url, &settings.model)) as SharedReviewer
+            });
+        let orchestrator =
+            Orchestrator::new(&state.project_root, project, state.worker.clone(), reviewer)?;
+        let job = orchestrator.run(job).await?;
+        let response = if job.record.state == JobState::Complete {
+            format!(
+                "✓ Job complete\n\n{}",
+                std::fs::read_to_string(job.path("final-report.md"))?
+            )
         } else {
-            let result = tools::execute(&tool, &state.project_root, &call.input).await?;
-            let message = format!(
-                "{}\n\nTool {} completed:\n{}",
-                message, result.name, result.output
-            );
-            let user_message = display_user_message(&request.instruction, &images);
-            chats::append(&mut chat_store, &chat_id, "user", &user_message)?;
-            chats::update_title_from_user(&mut chat_store, &chat_id, &request.instruction);
-            chats::append(&mut chat_store, &chat_id, "assistant", &message)?;
-            chats::save(&state.project_root, &chat_store)?;
-            return Ok(Json(AskResponse {
-                message,
-                changed,
-                pending_tool: None,
-                chats: chats::summaries(&chat_store),
-                messages: chats::messages(&chat_store, &chat_id),
-                chat_id,
-            }));
-        }
+            format!(
+                "Job {} stopped in {:?}: {}",
+                job.record.id, job.record.state, job.record.message
+            )
+        };
+        append_web_conversation(&job, &chat_id, "bender", "outbound", &response)?;
+        (response, job.record.state == JobState::Complete)
     } else {
-        None
+        if instruction.is_empty() {
+            return Err(anyhow::anyhow!("task cannot be empty").into());
+        }
+        if let Some(mut job) = store.latest_in_state("web", JobState::Clarifying)? {
+            let criteria = vec![
+                AcceptanceCriterion {
+                    id: "implementation".into(),
+                    description: "The clarified request is implemented within this workspace."
+                        .into(),
+                    verified: false,
+                },
+                AcceptanceCriterion {
+                    id: "checks".into(),
+                    description: "All configured required checks pass.".into(),
+                    verified: false,
+                },
+            ];
+            let specification = format!(
+                "# Proposed job specification\n\n## Original request\n\n{}\n\n## Clarification answers\n\n{instruction}\n\n## Acceptance criteria\n\n1. {}\n2. {}",
+                job.request()?,
+                criteria[0].description,
+                criteria[1].description
+            );
+            job.set_specification(&specification, &criteria)?;
+            append_web_conversation(&job, &chat_id, "web", "inbound", instruction)?;
+            let response = format!(
+                "Proposed acceptance criteria for {}:\n1. {}\n2. {}\n\nReply APPROVE to begin.",
+                job.record.id, criteria[0].description, criteria[1].description
+            );
+            append_web_conversation(&job, &chat_id, "bender", "outbound", &response)?;
+            (response, false)
+        } else {
+            let mut job = store.create(instruction, "web", Some(chat_id.clone()))?;
+            job.transition(
+                JobState::Clarifying,
+                "Waiting for scope and acceptance clarification",
+            )?;
+            let attachment_note = if request.images.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "\n{} image attachment(s) were recorded but are not forwarded to Codex CLI yet.",
+                    request.images.len()
+                )
+            };
+            append_web_conversation(&job, &chat_id, "web", "inbound", instruction)?;
+            let response = format!(
+                    "Before I begin {}:\n1. What observable behavior proves this is complete?\n2. Are there compatibility, security, or scope constraints?\n3. Which configured checks are required?\n\nReply with the answers; I will persist a specification for approval.{}",
+                    job.record.id, attachment_note
+                );
+            append_web_conversation(&job, &chat_id, "bender", "outbound", &response)?;
+            (response, false)
+        }
     };
-    let user_message = display_user_message(&request.instruction, &images);
+    let user_message = if request.images.is_empty() {
+        request.instruction.clone()
+    } else {
+        format!(
+            "{}\n\n[{} image attachment(s): {}]",
+            request.instruction,
+            request.images.len(),
+            request
+                .images
+                .iter()
+                .map(|image| format!(
+                    "{} ({}, {} bytes)",
+                    image.name,
+                    image.media_type,
+                    image.data_url.len()
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
     chats::append(&mut chat_store, &chat_id, "user", &user_message)?;
     chats::update_title_from_user(&mut chat_store, &chat_id, &request.instruction);
     chats::append(&mut chat_store, &chat_id, "assistant", &message)?;
@@ -704,11 +796,30 @@ async fn ask(
     Ok(Json(AskResponse {
         message,
         changed,
-        pending_tool,
+        pending_tool: None,
         chats: chats::summaries(&chat_store),
         messages: chats::messages(&chat_store, &chat_id),
         chat_id,
     }))
+}
+
+fn append_web_conversation(
+    job: &crate::jobs::Job,
+    conversation_id: &str,
+    sender: &str,
+    direction: &str,
+    content: &str,
+) -> Result<()> {
+    append_jsonl(
+        &job.path("conversation.jsonl"),
+        &serde_json::json!({
+            "timestamp": crate::jobs::now(),
+            "conversation_id": conversation_id,
+            "sender": sender,
+            "direction": direction,
+            "content": content
+        }),
+    )
 }
 
 async fn approve_tool(
@@ -739,7 +850,11 @@ async fn approve_tool(
         .chat_id
         .clone()
         .unwrap_or_else(|| chats::ensure_web_chat(&mut chat_store));
-    let tool_output = format!("{}\n{}", message, serde_json::to_string_pretty(&result.output)?);
+    let tool_output = format!(
+        "{}\n{}",
+        message,
+        serde_json::to_string_pretty(&result.output)?
+    );
     chats::append(&mut chat_store, &chat_id, "assistant", &tool_output)?;
     chats::save(&state.project_root, &chat_store)?;
     Ok(Json(ApproveToolResponse {
@@ -748,29 +863,6 @@ async fn approve_tool(
         chats: chats::summaries(&chat_store),
         messages: chats::messages(&chat_store, &chat_id),
     }))
-}
-
-fn new_pending_tool_id() -> String {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or_default();
-    format!("tool-{millis}")
-}
-
-fn display_user_message(instruction: &str, images: &[providers::PromptImage]) -> String {
-    if images.is_empty() {
-        return instruction.to_string();
-    }
-    let mut message = instruction.to_string();
-    if !message.is_empty() {
-        message.push_str("\n\n");
-    }
-    message.push_str("Attached images:\n");
-    for image in images {
-        message.push_str(&format!("- {} ({})\n", image.name, image.media_type));
-    }
-    message.trim_end().to_string()
 }
 
 async fn require_auth(state: &AppState, headers: &HeaderMap) -> Result<(), AppError> {
@@ -1044,6 +1136,8 @@ const INDEX: &str = r#"<!doctype html>
         </div>
       </details>
       <div class="chat-list-wrap">
+        <div class="chat-list-title">Jobs</div>
+        <div id="jobList" class="chat-list"></div>
         <button class="ghost" id="newChat">New chat</button>
         <div class="chat-list-title">Chats</div>
         <div id="chatList" class="chat-list"></div>
@@ -1070,7 +1164,7 @@ const INDEX: &str = r#"<!doctype html>
           <div class="composer-row">
             <button id="attachImage" class="attach-button" title="Attach image">＋</button>
             <input id="imageInput" class="image-input" type="file" accept="image/*" multiple />
-            <textarea id="instruction" placeholder="Ask Bender anything..."></textarea>
+            <textarea id="instruction" placeholder="Describe a software job, or reply APPROVE..."></textarea>
             <button id="send" class="send-floating" title="Send">↑</button>
           </div>
           <div id="statusLine" class="status-line"></div>
@@ -1131,6 +1225,7 @@ const INDEX: &str = r#"<!doctype html>
       $('auth').textContent = status.has_provider_auth ? 'provider auth ready' : 'provider auth missing';
       $('relays').textContent = status.relays.join(', ');
       renderTools(status.tools, status.tool_paths);
+      renderJobs(status.jobs);
       renderChats(status.chats);
       renderMessages(status.messages);
     }
@@ -1156,6 +1251,11 @@ const INDEX: &str = r#"<!doctype html>
           closeDrawerOnMobile();
         };
       });
+    }
+    function renderJobs(jobs) {
+      $('jobList').innerHTML = jobs.length
+        ? jobs.map(job => `<div class="chat-item" title="${escapeHtml(job.message)}"><strong>${escapeHtml(job.state)}</strong> · attempt ${job.attempt}<br><small>${escapeHtml(job.id)}</small></div>`).join('')
+        : '<div class="chat-item">No jobs yet</div>';
     }
     function renderMessages(messages) {
       $('messages').innerHTML = messages.length
@@ -1442,6 +1542,23 @@ fn project_warning(project_root: &std::path::Path) -> Option<String> {
         .any(|window| window == ["target", "release"] || window == ["target", "debug"]);
 
     is_cargo_output.then(|| {
-        "You are running Bender from a Cargo build output folder. Copy the binary into the project folder you want controlled and run it there.".to_string()
+        "This looks like a Cargo build-output folder. Bender controls its launch directory; cd to the intended project and run the globally installed bender binary there.".to_string()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_ui_exposes_jobs_approval_and_loopback_defaults() {
+        assert!(INDEX.contains("Jobs"));
+        assert!(INDEX.contains("reply APPROVE"));
+        assert!(INDEX.contains("jobList"));
+        assert!(crate::config::Config::new(nostr_sdk::Keys::generate())
+            .unwrap()
+            .bind
+            .ip()
+            .is_loopback());
+    }
 }

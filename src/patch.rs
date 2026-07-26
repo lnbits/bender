@@ -130,21 +130,44 @@ fn validate_relative_patch_path(root: &Path, raw_path: &str) -> Result<()> {
         anyhow::bail!("protected project metadata path");
     }
 
-    let absolute = root.join(path);
-    if absolute.exists() {
-        let canonical = absolute.canonicalize()?;
-        if !canonical.starts_with(root) {
-            anyhow::bail!("path resolves outside project root");
-        }
-    } else {
-        let parent = absolute.parent().context("patch path has no parent")?;
-        let canonical_parent = parent
-            .canonicalize()
-            .with_context(|| format!("parent directory does not exist: {}", parent.display()))?;
-        if !canonical_parent.starts_with(root) {
-            anyhow::bail!("parent resolves outside project root");
-        }
+    crate::workspace::Workspace::new(root)?
+        .resolve_worker_write(path)
+        .map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    fn patch(path: &str) -> String {
+        format!(
+            "diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1 @@\n+ok\n"
+        )
     }
 
-    Ok(())
+    #[test]
+    fn accepts_nested_nonexistent_targets_and_rejects_protected_paths() {
+        let root = tempdir().unwrap();
+        assert!(validate_patch(root.path(), &patch("src/new/deep/file.rs")).is_ok());
+        assert!(validate_patch(root.path(), &patch("../sibling")).is_err());
+        assert!(validate_patch(root.path(), &patch(".git/config")).is_err());
+        assert!(validate_patch(root.path(), &patch(".bender/config.toml")).is_err());
+        assert!(validate_patch(root.path(), &patch("target/output")).is_err());
+        assert!(validate_patch(root.path(), &patch("node_modules/pkg")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_patch_through_nested_symlink() {
+        use std::os::unix::fs::symlink;
+        let parent = tempdir().unwrap();
+        let root = parent.path().join("project");
+        let sibling = parent.path().join("sibling");
+        fs::create_dir_all(root.join("nested")).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        symlink(&sibling, root.join("nested/escape")).unwrap();
+        assert!(validate_patch(&root, &patch("nested/escape/file")).is_err());
+    }
 }

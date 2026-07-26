@@ -1,0 +1,16 @@
+pub mod chats;
+pub mod command_runner;
+pub mod config;
+pub mod doctor;
+pub mod jobs;
+pub mod nostr_agent;
+pub mod orchestrator;
+pub mod patch;
+pub mod project;
+pub mod project_config;
+pub mod providers;
+pub mod runtime;
+pub mod tools;
+pub mod web;
+pub mod worker;
+pub mod workspace;

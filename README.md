@@ -1,222 +1,217 @@
+# Bender
 
-  <img src="logo.png" alt="Bender logo" width="380">
+<img src="logo.png" alt="Bender logo" width="380">
 
-![Beta](https://img.shields.io/badge/status-beta-f0b429)
+Install Bender once, enter any project folder and run `bender`. Bender uses that folder as its security boundary, receives development tasks locally or over Nostr, delegates coding work to Codex CLI or an optional local worker, independently runs approved checks, and reports completion evidence.
 
-Clawbot’s model is backwards. It starts with access to everything and then tries to restrict permissions afterward. Bender takes the opposite approach: it only has access to a specific folder and the tools you explicitly give it, start with minimal access, then expand only when needed.
+Bender controls the job. Codex performs the main coding work. A model response or zero Codex exit status never marks a job complete.
 
-Run the Bender binary from any folder and he will only have access to that folder and what it contains. Connect over Nostr private DMs, because Nostr is good and Telegram and WhatsApp are also backwards.
+## Quick start
 
+```bash
+curl -fsSL https://raw.githubusercontent.com/lnbits/bender/main/install.sh | sh
+
+codex login
+
+cd ~/Projects/some-project
+bender setup
+# Review the proposal, then approve its argv arrays:
+bender setup --accept-detected
+bender doctor
+bender
 ```
-# For bender to only see whats in some-other-project
-cd /home/ben/Projects/some-other-project
-/home/ben/Projects/bender/target/release/bender init
-/home/ben/Projects/bender/target/release/bender run
-```
 
+Bare `bender` is the normal equivalent of `bender run`. It canonicalizes the current directory and never switches to Bender's installation directory. The local UI is printed at startup and binds to `127.0.0.1:7331` by default.
 
-  <img src="bender.gif" alt="Clawbot is dumb" width="300">
+VS Code is optional: run the same commands in its integrated terminal or any normal terminal. No extension is required.
 
+## One folder, one Bender
 
-Bender is a tiny native Rust daemon.
+If Bender starts in `/srv/projects/example`, that directory is the immutable workspace root. Project source scans do not follow symlinks. Reads and new write targets are checked through canonical existing ancestors; parent traversal, absolute external paths, sibling repositories, symlink escapes, `.git`, and worker writes to `.bender` are rejected.
 
-The shape is:
+Each project owns:
 
 ```text
-Nostr DM -> Bender daemon -> LLM provider -> Bender validates file changes -> changes are applied inside cwd
+.bender/
+├── config.toml
+├── project.toml
+├── jobs/
+└── artifacts/
 ```
 
-The model does not get shell access. It can answer normally, and when it needs to change files Bender applies validated changes inside the folder it was started from.
+Codex authentication stays under Codex's own machine-level login. Bender neither copies nor stores it. Ollama model files also remain managed by Ollama.
 
-## Simple Install
-
-Use one of the installers here: [latest release assets](../../releases/latest).
-
-Release tags publish:
-
-- `bender-linux-x86_64`: raw Linux binary.
-- `bender-linux-x86_64.tar.gz`: compressed Linux binary.
-- `bender-windows-x86_64.exe`: Windows executable.
-- `bender-windows-x86_64.zip`: compressed Windows executable.
-- `Bender-macos-x86_64.dmg`: macOS Intel DMG.
-- `Bender-macos-aarch64.dmg`: macOS Apple Silicon DMG.
-- `Bender-linux-x86_64.flatpak`: Flatpak bundle.
-
-Drop the binary into the folder you want Bender to control:
-
-```sh
-./bender init
-./bender run
-```
-
-Open:
+Useful commands:
 
 ```text
-http://bender.localhost:7331
+bender
+bender run
+bender init
+bender setup
+bender doctor
+bender jobs
+bender models
+bender workers
+bender status
+bender version
+bender update
 ```
 
-Bender binds to `127.0.0.1:7331` by default. If that port is busy:
+## Approved project commands
 
-```sh
-./bender run --bind 127.0.0.1:7332
-```
+`bender setup` only prints detected proposals. Nothing is approved until the project owner edits `.bender/project.toml` or runs `bender setup --accept-detected`.
 
-Or:
-
-```sh
-BENDER_BIND=127.0.0.1:7332 ./bender run
-```
-
-## Hard Install
-
-Build from source:
-
-```sh
-nix develop path:/home/ben/Projects/watup
-cargo build --release
-```
-
-The drop-in binary is:
-
-```text
-target/release/bender
-```
-
-Run from source while developing:
-
-```sh
-nix develop path:/home/ben/Projects/watup
-cargo run -- init
-cargo run -- run
-```
-
-With API keys from the environment:
-
-```sh
-OPENAI_API_KEY=sk-... cargo run -- run
-ANTHROPIC_API_KEY=sk-ant-... cargo run -- run
-DEEPSEEK_API_KEY=sk-... cargo run -- run
-```
-
-## Setup
-
-The web UI lets you save:
-
-- controller `npub`
-- provider
-- provider API keys
-- local provider URLs
-- model
-
-## Drop-in tools
-
-Bender can use extra tools only after you explicitly add their folder in the web
-UI. Each tool is a folder with a `bender-tool.toml` manifest and an executable
-that accepts JSON on stdin and returns JSON on stdout.
-
-Example:
-
-```text
-/home/you/bender-tools/github-prs/
-  bender-tool.toml
-  run.py
-```
-
-Add that folder in the web UI under `Tool folder`. Tools are only available to
-the Bender instance whose config lists that folder. A tool with
-`requires_confirmation = true` will pause in the web UI and ask for approval
-before it runs.
-
-Bender core still validates file patches so they stay inside the folder Bender
-is running in. Tools are separate executable code, so only add tool folders you
-trust.
-
-See `examples/tools/hello` and `examples/tools/github-prs` for starter tools.
-
-Use `github-prs` when you want the approved tool to switch branches, create a
-branch, commit the current changes, push, and open a draft PR.
-
-Bender generates its own Nostr keypair during `bender init`. It stores config in:
-
-```text
-.bender/config.toml
-```
-
-Example:
+Commands are argv arrays—Bender never builds an implicit `sh -c` string:
 
 ```toml
-name = "Bender"
-secret_key = "nsec1..."
-public_key = "npub1..."
-controller_npub = ""
-provider = "openai"
-openai_api_key = ""
-anthropic_api_key = ""
-deepseek_api_key = ""
-model = "gpt-5.1-codex-mini"
-ollama_base_url = "http://127.0.0.1:11434"
-llama_cpp_base_url = "http://127.0.0.1:8080"
-bind = "127.0.0.1:7331"
-relays = [
-  "wss://relay.damus.io",
-  "wss://nos.lol",
-  "wss://relay.primal.net",
-  "wss://relay.nostr.band",
-  "wss://relay.snort.social",
-  "wss://nostr.mom",
-  "wss://offchain.pub",
-  "wss://relay.current.fyi",
-  "wss://nostr.wine",
-  "wss://relayable.org",
-]
+[project]
+name = "example"
+
+[commands]
+setup = ["uv", "sync"]
+build = ["npm", "run", "build"]
+lint = ["uv", "run", "ruff", "check", "."]
+typecheck = ["npm", "run", "typecheck"]
+unit = ["uv", "run", "pytest", "-q"]
+integration = ["uv", "run", "pytest", "tests/integration"]
+start = ["uv", "run", "app"]
+ui = ["npx", "playwright", "test"]
+
+[completion]
+required_checks = ["lint", "typecheck", "unit"]
+max_attempts = 4
+require_approval = true
+require_review = false
 ```
 
-Supported providers:
+Checks run with the workspace as their current directory, bounded output and timeouts, a minimal environment, no inherited SSH agent, and process-group cleanup. `sudo`, Docker, Git push, deployment, and arbitrary commands are not completion checks.
 
-- `openai`: OpenAI and Codex models.
-- `anthropic`: Claude API.
-- `deepseek`: DeepSeek API.
-- `ollama`: local Ollama models, no API key needed.
-- `llama_cpp`: local llama.cpp OpenAI-compatible server, API key optional.
+Bender tells Codex to inspect `AGENTS.md` and `.bender/instructions.md` when present; their project-specific content is not built into Bender.
 
-The model dropdown changes with the provider. Refresh Models asks the selected provider for available models when that provider has a model-list endpoint Bender can use.
+## Job lifecycle and evidence
 
-## Nostr
-
-Send a NIP-17 private DM to Bender's `npub` from the configured `controller_npub`:
+A local or Nostr task becomes:
 
 ```text
-please add a notes file with ideas for the next release
+Received → Clarifying → AwaitingApproval → Approved
+→ Working → Checking → Fixing (when needed)
+→ Reviewing (optional) → Complete
 ```
 
-Bender ignores DMs from any other sender. If your request is just a question, it replies with text. If your request needs a file change, it validates and applies it automatically.
+Other terminal/action states are `AwaitingActionApproval`, `Blocked`, `Failed`, and `Cancelled`. Each job is stored atomically under `.bender/jobs/<job-id>/` with the request, conversation, approved specification, criteria, events, worker invocations, changed files, check results, review, completion gates, artifacts, and final report.
 
-Bender publishes its Nostr profile as `Bender`, with the bio `I bend things https://github.com/lnbits/bender`, `profile.png` as the picture, and `bender.gif` as the banner.
+On restart, an in-flight job is marked interrupted and blocked for explicit resume/retry; Bender never assumes an old PID is alive or completes it automatically.
 
-## Local URL
-
-The portable no-setup URL is:
+The repair loop is:
 
 ```text
-http://bender.localhost:7331
+Codex implementation
+→ Bender runs approved checks
+→ exact failure evidence returns to the Codex session
+→ Codex repairs
+→ Bender reruns checks
 ```
 
-`bender.local` needs either mDNS support or a hosts-file entry:
+Repeated unchanged failures and maximum attempts block the job. “Not run” is not “passed,” and all configured required gates must pass.
 
-```text
-127.0.0.1 bender.local
+## Codex, Qwen and Gemma
+
+Codex CLI is the primary worker. Bender invokes the installed `codex exec` using argv, `--json`, a JSON output schema, `workspace-write`, an explicit approval policy, and the selected folder as `--cd`. Stdout/stderr and process metadata are retained. Hidden chain-of-thought is neither requested nor stored.
+
+Qwen through Ollama is an optional fallback and is never selected silently:
+
+```toml
+[workers.qwen]
+enabled = true
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+model = "qwen2.5-coder:14b"
+timeout_seconds = 1800
 ```
 
-Then open:
+Gemma can independently review the approved request, diff/check evidence, and warnings:
 
-```text
-http://bender.local:7331
+```toml
+[reviewers.gemma]
+enabled = true
+provider = "ollama"
+base_url = "http://127.0.0.1:11434"
+model = "gemma3:12b"
+timeout_seconds = 600
+
+[completion]
+required_checks = ["unit"]
+require_review = true
 ```
 
-## Security Notes
+A reviewer may approve, request changes, or block. It cannot set `Complete`; Bender evaluates the gates.
 
-Bender controls the folder you run it from. If you run `./bender init` inside `target/release`, it creates `target/release/.bender` and treats `target/release` as the project.
+Optional model installation remains a separate user action:
 
-File changes are restricted to the current folder and Bender blocks writes into `.bender`, `.git`, `target`, and `node_modules`.
+```bash
+ollama pull qwen2.5-coder:14b
+ollama pull gemma3:12b
+```
 
-Hosted API usage is billed to the provider API key saved in Bender. Local Ollama and llama.cpp usage runs on your machine. Token use depends on the model, request size, and folder context sent with the request.
+## Nostr remote control
+
+Configure exactly one controller identity in the loopback setup UI. Bender ignores other senders. A task is persisted with its conversation identifier and acceptance criteria; the controller must reply `APPROVE` before Codex or checks run. Bender returns the terminal state and final report without sending verbose raw worker logs unless requested.
+
+The web UI is not required for Nostr-only operation, and it is not exposed publicly by default.
+
+## VPS service
+
+The architecture is identical on a headless server:
+
+```bash
+codex login
+cd /srv/projects/example
+bender setup
+bender doctor
+bender
+```
+
+For persistence, copy `packaging/bender.service.example` to
+`~/.config/systemd/user/bender-example.service`, edit both absolute paths, then:
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now bender-example
+loginctl enable-linger "$USER"   # optional; administrator policy may apply
+```
+
+The service sets an explicit `WorkingDirectory` and loopback bind. Run one service—with a distinct port and state directory—for each explicit workspace. Do not create one daemon with access to every repository. Nostr is the intended remote channel.
+
+## Runtime and browser checks
+
+Projects may define an approved supervised runtime and UI category:
+
+```toml
+[runtime]
+start_command = "start"
+base_url = "http://127.0.0.1:5000"
+healthcheck_url = "http://127.0.0.1:5000/health"
+startup_timeout_seconds = 90
+
+[ui]
+enabled = true
+test_command = "ui"
+browser = "chromium"
+fail_on_console_error = true
+```
+
+Playwright, browsers, Node, Python, Rust, Docker, Ollama, and Codex are not installed by Bender. `bender doctor` checks only ecosystems relevant to the approved project configuration.
+
+## Development and release
+
+```bash
+nix develop
+cargo fmt --check
+cargo clippy --all-targets --all-features --locked -- -D warnings
+cargo test --all-targets --all-features --locked
+cargo build --release --locked
+```
+
+Release tags drive `.github/workflows/release.yml`. A maintainer reviews the clean diff and CI, updates the version/changelog, commits, creates an annotated `vX.Y.Z` tag, and pushes that tag. Bender never pushes, tags, publishes, deploys, or releases without explicit authorization.
+
+Skills and thin editor clients can be added later; neither expands the workspace boundary nor overrides completion gates.

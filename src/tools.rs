@@ -66,7 +66,8 @@ pub fn discover(config: &Config, project_root: &Path) -> Result<Vec<Tool>> {
         let Ok(canonical_tool_path) = tool_path.path.canonicalize() else {
             continue;
         };
-        if canonical_tool_path.starts_with(&project_root) {
+        let allowed_tools_root = project_root.join(".bender").join("tools");
+        if !canonical_tool_path.starts_with(&allowed_tools_root) {
             continue;
         }
         if canonical_tool_path.join("bender-tool.toml").exists() {
@@ -167,8 +168,8 @@ fn load_tool(root: &Path) -> Result<Tool> {
     let manifest_path = root.join("bender-tool.toml");
     let raw = fs::read_to_string(&manifest_path)
         .with_context(|| format!("could not read {}", manifest_path.display()))?;
-    let manifest: ToolManifest = toml::from_str(&raw)
-        .with_context(|| format!("invalid {}", manifest_path.display()))?;
+    let manifest: ToolManifest =
+        toml::from_str(&raw).with_context(|| format!("invalid {}", manifest_path.display()))?;
     Ok(Tool {
         name: manifest.name,
         version: manifest.version,

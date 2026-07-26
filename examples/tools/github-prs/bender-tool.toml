@@ -1,0 +1,72 @@
+name = "github-prs"
+version = "0.1.0"
+description = "GitHub PR helper. Actions: pull fetches/prunes remotes, fast-forwards the current branch when it has an upstream, and reports new/updated remote branches with latest commit subjects; switch_branch checks out an existing branch such as main; create_pr creates a branch, commits current worktree changes, pushes, and opens a draft PR. Examples: {\"action\":\"pull\"}; {\"action\":\"switch_branch\",\"branch\":\"main\"}; {\"action\":\"create_pr\",\"summary\":\"short change summary\"}."
+command = "./run.py"
+requires_confirmation = true
+
+permissions = [
+  "git:branch",
+  "git:checkout",
+  "git:fetch",
+  "git:pull",
+  "git:add",
+  "git:commit",
+  "git:push",
+  "network:github.com",
+  "command:gh",
+]
+
+[input_schema]
+type = "object"
+
+[input_schema.properties.action]
+type = "string"
+description = "Action to run. Use pull to fetch/prune, fast-forward current branch when possible, and report new/updated remote branches. Use switch_branch to checkout a branch. Use create_pr to create a branch, commit worktree changes, push, and open a draft PR. Defaults to create_pr."
+
+[input_schema.properties.branch]
+type = "string"
+description = "Branch name. Required for switch_branch, for example main. Optional for create_pr; if omitted, inferred as bender/<date>-<slug>."
+
+[input_schema.properties.commit_message]
+type = "string"
+description = "Optional git commit message. If omitted, inferred from title/summary or changed files."
+
+[input_schema.properties.title]
+type = "string"
+description = "Optional pull request title. If omitted, inferred from summary/intent or changed files."
+
+[input_schema.properties.body]
+type = "string"
+description = "Optional pull request body. If omitted, includes title and changed files."
+
+[input_schema.properties.intent]
+type = "string"
+description = "Optional high-level intent. Use create_pr for the common case where Bender has already edited files and should make a PR. switch_branch aliases are also accepted."
+
+[input_schema.properties.summary]
+type = "string"
+description = "Optional short human summary used to infer branch, commit message, and PR title."
+
+[input_schema.properties.base]
+type = "string"
+description = "Base branch. Defaults to main."
+
+[input_schema.properties.draft]
+type = "boolean"
+description = "Create the pull request as a draft. Defaults to true."
+
+[input_schema.properties.dry_run]
+type = "boolean"
+description = "Return the commands that would run without executing them."
+
+[input_schema.properties.create]
+type = "boolean"
+description = "For switch_branch only: create/reset the branch with git checkout -B. Defaults to false, so switching to main is allowed without creating it."
+
+[input_schema.properties.pull_current]
+type = "boolean"
+description = "For pull only: after fetching, run git pull --ff-only on the current branch if it has an upstream. Defaults to true."
+
+[output_schema]
+type = "object"
+required = ["ok"]
